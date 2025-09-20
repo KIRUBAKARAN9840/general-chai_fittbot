@@ -13,12 +13,11 @@ from app.models.database import get_db
 # ⚠️ Use only dependency callables; don't annotate them with Redis/OpenAI types here.
 from app.models.deps import get_http, get_oai, get_mem
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.kb_store import KB
-from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.nutrition import FOOD_DB
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.llm_helpers import (
     PlainTextStreamFilter, oai_chat_stream, GENERAL_SYSTEM, TOP_K,
-    build_messages, heuristic_confidence, gpt_extract_items, first_missing_quantity,OPENAI_MODEL,
-    sse_json, sse_escape, gpt_small_route, _scale_macros, is_yes, is_no,is_fit_chat,
-    has_action_verb, food_hits,ensure_per_unit_macros, is_fittbot_meta_query,normalize_food, explicit_log_command, STYLE_PLAN, is_plan_request,STYLE_CHAT_FORMAT,pretty_plan
+    build_messages, heuristic_confidence, OPENAI_MODEL,
+    sse_json, sse_escape, gpt_small_route, is_yes, is_no, is_fitness_related,
+    has_action_verb, is_fittbot_meta_query, is_plan_request, STYLE_PLAN, STYLE_CHAT_FORMAT, pretty_plan
 )
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.report_analysis import (
     is_analysis_intent,
@@ -95,7 +94,7 @@ def pretty_plan(markdown: str) -> str:
     txt = re.sub(r':(?!\s)', ': ', txt)
     txt = re.sub(r',(?!\s)', ', ', txt)
 
-    # Fix “words-smashed” by accidental no-space around hyphens
+    # Fix "words-smashed" by accidental no-space around hyphens
     # "withwhole-grain" → "with whole-grain"
     txt = re.sub(r'([A-Za-z])([-–—])([A-Za-z])', r'\1 \2 \3', txt)
 
@@ -104,9 +103,6 @@ def pretty_plan(markdown: str) -> str:
     txt = "\n".join(line.rstrip() for line in txt.split("\n"))
 
     return txt.strip()
-
-
-_MACRO_KEYS = ("calories","protein","carbs","fat","fiber","sugar")
 
 
 @router.get("/chat/stream_test", dependencies=[Depends(RateLimiter(times=30, seconds=60))])
@@ -127,8 +123,8 @@ async def chat_stream(
     pend = (await mem.get_pending(user_id)) or {}
     mode = await get_mode(mem, user_id)  # "analysis" or None
 
-    # If user explicitly goes to log or plan/chat, exit analysis mode (so routes stay clean)
-    if explicit_log_command(tlower) or is_plan_request(tlower):
+    # If user explicitly goes to plan/chat, exit analysis mode (so routes stay clean)
+    if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
 
     if pend.get("state") == "awaiting_analysis_confirm":
@@ -179,251 +175,13 @@ async def chat_stream(
         return StreamingResponse(_nav_clar(), media_type="text/event-stream",
                                  headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-    # ---- FOOD LOG: awaiting log-intent confirm ----
-    if pend.get("state") == "awaiting_log_intent_confirm":
-        proposal = pend.get("proposal") or {}
-        if is_yes(text):
-            idx, fname = first_missing_quantity(proposal.get("items", []))
-            if idx >= 0:
-                ask = proposal["items"][idx].get("ask") or f"How many {proposal['items'][idx].get('unit_hint','pieces')} of {fname or 'items'} did you have?"
-                await mem.set_pending(user_id, {"state":"awaiting_quantity",
-                                                "holder": {"proposal": proposal, "next_q_idx": idx}})
-                async def _needs_qty():
-                    yield sse_json({"type":"food_log","status":"needs_quantity","prompt":ask,"proposal":proposal})
-                    yield "event: ping\ndata: {}\n\n"
-                    yield "event: done\ndata: [DONE]\n\n"
-                return StreamingResponse(_needs_qty(), media_type="text/event-stream",
-                                         headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-            else:
-                import hashlib, orjson
-                proposal_id = hashlib.sha1(orjson.dumps(proposal)).hexdigest()
-                proposal["proposal_id"] = proposal_id
-                await mem.set_pending(user_id, {"state":"awaiting_log_confirm", "proposal": proposal})
-                async def _confirm():
-                    yield sse_json({"type":"food_log","status":"confirm","prompt":"Shall I log this entry?","proposal":proposal})
-                    yield "event: ping\ndata: {}\n\n"
-                    yield "event: done\ndata: [DONE]\n\n"
-                return StreamingResponse(_confirm(), media_type="text/event-stream",
-                                         headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        if is_no(text):
-            await mem.set_pending(user_id, None)
-            async def _no_log():
-                yield sse_json({"type":"food_log","status":"skip_log","prompt":"Okay, I won’t log it. How can I help you?"})
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_no_log(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        async def _clar_log():
-            yield sse_json({"type":"food_log","status":"ask_log_intent",
-                            "prompt":"Do you want me to log this? (yes/no)","proposal": proposal})
-            yield "event: ping\ndata: {}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
-        return StreamingResponse(_clar_log(), media_type="text/event-stream",
-                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-    # ---- FOOD LOG: awaiting quantity ----
-    if pend.get("state") == "awaiting_quantity":
-        if is_no(text):
-            await mem.set_pending(user_id, None)
-            async def _cancel_q():
-                yield sse_json({"type":"food_log","status":"cancelled"})
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_cancel_q(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-        holder   = pend["holder"]
-        proposal = holder["proposal"]
-        idx, _   = first_missing_quantity(proposal["items"])
-        holder["next_q_idx"] = idx
-        pend["holder"] = holder
-        await mem.set_pending(user_id, pend)
-
-        if idx == -1:
-            await mem.set_pending(user_id, {"state":"awaiting_log_confirm", "proposal": proposal})
-
-        from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.llm_helpers import QuantityValidator, extract_numbers  # <- keep this path
-        nums = extract_numbers(text)
-
-        async def stream_needs_qty(fname: str, ask: str):
-            yield sse_json({"type":"food_log","status":"needs_quantity",
-                            "prompt": ask or f"How many {fname or 'items'} did you have?",
-                            "proposal": proposal})
-            yield "event: ping\ndata: {}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
-
-        if idx >= 0 and nums:
-            qty = float(nums[0])
-            try:
-                QuantityValidator(quantity=qty)
-            except Exception:
-                item = proposal["items"][idx]
-                return StreamingResponse(
-                    stream_needs_qty(item.get("food") or "items", item.get("ask")),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"}
-                )
-
-            item = proposal["items"][idx]
-            item["quantity"] = qty
-            ensure_per_unit_macros(item)
-            _scale_macros([item])
-
-            new_idx, _ = first_missing_quantity(proposal["items"])
-            if new_idx >= 0:
-                holder["next_q_idx"] = new_idx
-                pend["holder"] = holder
-                await mem.set_pending(user_id, pend)
-                nxt = proposal["items"][new_idx]
-                return StreamingResponse(
-                    stream_needs_qty(nxt.get("food") or "items", nxt.get("ask")),
-                    media_type="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"}
-                )
-
-            import hashlib, orjson
-            proposal_id = hashlib.sha1(orjson.dumps(proposal)).hexdigest()
-            proposal["proposal_id"] = proposal_id
-            await mem.set_pending(user_id, {"state":"awaiting_log_confirm", "proposal": proposal})
-            async def _confirm():
-                yield sse_json({"type":"food_log","status":"confirm",
-                                "prompt":"Shall I log this entry?","proposal":proposal})
-                yield "event: ping\ndata: {}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_confirm(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            item = proposal["items"][idx] if idx >= 0 else {}
-            return StreamingResponse(
-                stream_needs_qty(item.get("food") or "items", item.get("ask")),
-                media_type="text/event-stream",
-                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"}
-            )
-
-    # ---- FOOD LOG: awaiting final confirm ----
-    if pend.get("state") == "awaiting_log_confirm":
-        proposal ={}or pend.get("proposal")
-        if is_yes(text):
-            async def _logged_then_nav():
-                yield sse_json({"type":"food_log","status":"logged","is_log":True,"entry":proposal})
-                yield "event: ping\ndata: {}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            await mem.set_pending(user_id, {"state":"awaiting_nav_confirm"})
-            return StreamingResponse(_logged_then_nav(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        if is_no(text):
-            await mem.set_pending(user_id, None)
-            async def _cancel():
-                yield sse_json({"type":"food_log","status":"cancelled","prompt":"Okay, I didn’t log anything. If you have any fitness related queries we can continue chatting"})
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_cancel(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        async def _clar():
-            yield sse_json({"type":"food_log","status":"confirm",
-                            "prompt":"I didn't catch that – shall I log this entry?",
-                            "proposal":proposal})
-            yield "event: ping\ndata: {}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
-        return StreamingResponse(_clar(), media_type="text/event-stream",
-                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
     # =========================
     # 2) FRESH TURN: TRIGGERED ACTIONS
     # =========================
 
-    # --- A) explicit "log/add/record/track ..." → go straight to logging flow
-    if explicit_log_command(tlower):
-        import re as _re, hashlib, orjson
-        cleaned_text = text
-        while True:
-            new_text = _re.sub(r'^\s*(log|add|record|track)\b[:,\-\s]*', '', cleaned_text, flags=_re.I)
-            if new_text == cleaned_text: break
-            cleaned_text = new_text
-        raw = _re.sub(r"[^A-Za-z\u0900-\u0fff\s]", " ", cleaned_text, flags=_re.UNICODE)
-        words = [w.lower() for w in raw.split() if w.strip()]
-        STOP = {"log","add","record","track","please","plz","me","i","my","to","for","of","and","a","an","the","yes","no","ok","okay","hai","haa","haan","haanji","bro","dear"}
-        words = [w for w in words if w not in STOP]
-        cands = set()
-        n = len(words)
-        for i in range(n):
-            cands.add(words[i])
-            if i+1 < n: cands.add(words[i]+" "+words[i+1])
-            if i+2 < n: cands.add(words[i]+" "+words[i+1]+" "+words[i+2])
-        if not cands:
-            await mem.set_pending(user_id, None)
-            async def _need_food_name():
-                yield sse_json({"type":"food_log","status":"needs_food","prompt":"What food would you like to log?"})
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_need_food_name(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        items = gpt_extract_items(cleaned_text, oai, candidates=sorted(cands))
-        for it in items:
-            it["food"] = normalize_food(it.get("food"))
-            ensure_per_unit_macros(it)
-        known_items = [it for it in items if it.get("food") and all(isinstance(it.get(k),(int,float)) for k in ("calories","protein","carbs","fat","fiber","sugar"))]
-        if not known_items:
-            await mem.set_pending(user_id, None)
-            async def _no_food():
-                yield sse_json({"type":"food_log","status":"not_food","prompt":"Oops, sorry—I couldn’t recognize any food items. I didn’t log anything."})
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_no_food(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        for it in known_items:
-            if it.get("quantity") not in (None, 0, ""):
-                _scale_macros([it])
-
-        proposal = {"meal_type": None, "log_time_iso": now_iso, "items": known_items}
-        idx, fname = first_missing_quantity(known_items)
-        if idx >= 0:
-            ask = known_items[idx].get("ask") or f"How many {known_items[idx].get('unit_hint','pieces')} of {fname or 'items'} did you have?"
-            await mem.set_pending(user_id, {"state":"awaiting_quantity", "holder": {"proposal": proposal, "next_q_idx": idx}})
-            async def _needs_qty():
-                yield sse_json({"type":"food_log","status":"needs_quantity","prompt":ask,"proposal":proposal})
-                yield "event: ping\ndata: {}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_needs_qty(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            proposal_id = hashlib.sha1(orjson.dumps(proposal)).hexdigest()
-            proposal["proposal_id"] = proposal_id
-            await mem.set_pending(user_id, {"state":"awaiting_log_confirm", "proposal": proposal})
-            async def _confirm():
-                yield sse_json({"type":"food_log","status":"confirm","prompt":"Shall I log this entry?","proposal":proposal})
-                yield "event: ping\ndata: {}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_confirm(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-    # --- B) foods mentioned (no explicit "log") → ask log intent once
-    if food_hits(text) > 0:
-        items = gpt_extract_items(text, oai)
-        for it in items:
-            it["food"] = normalize_food(it.get("food"))
-            ensure_per_unit_macros(it)
-        known_items = []
-        for it in items:
-            if it.get("food"):
-                try:
-                    if all(isinstance(it.get(k), (int, float)) for k in ("calories","protein","carbs","fat","fiber","sugar")):
-                        known_items.append(it)
-                except Exception:
-                    pass
-        if known_items:
-            for it in known_items:
-                if it.get("quantity") not in (None, 0, ""):
-                    _scale_macros([it])
-            proposal = {"meal_type": None, "log_time_iso": now_iso, "items": known_items}
-            await mem.set_pending(user_id, {"state":"awaiting_log_intent_confirm", "proposal": proposal})
-            async def _ask_log_intent():
-                yield sse_json({"type":"food_log","status":"ask_log_intent",
-                                "prompt":"I spotted food items. Do you want me to log this? (yes/no)",
-                                "proposal": proposal})
-                yield "event: ping\ndata: {}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_ask_log_intent(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-    # --- C) analysis start or follow-ups (only when nothing above already handled this turn)
+    # --- analysis start or follow-ups
     # follow-ups while already in analysis mode
-    if mode == "analysis" and not explicit_log_command(tlower) and not is_plan_request(tlower):
+    if mode == "analysis" and not is_plan_request(tlower):
         if is_followup_question(text):
             dataset, summary = await get_analysis_artifacts(mem, user_id)
             if dataset:
@@ -466,8 +224,20 @@ async def chat_stream(
     # =========================
     # 3) NORMAL CHAT (fallback)
     # =========================
-    is_meta = is_fittbot_meta_query(text) and not (is_plan_request(text) or is_fit_chat(text))
-    is_plan = is_plan_request(text) or is_fit_chat(text)
+    
+    # Check if the query is fitness-related first
+    if not is_fitness_related(text) and not is_fittbot_meta_query(text):
+        async def _not_fitness():
+            redirect_msg = "I'm a specialized fitness assistant and can only help with exercise, health, and wellness topics. How can I help you with your fitness journey today?"
+            yield sse_escape(redirect_msg)
+            await mem.add(user_id, "user", text.strip())
+            await mem.add(user_id, "assistant", redirect_msg)
+            yield "event: done\ndata: [DONE]\n\n"
+        return StreamingResponse(_not_fitness(), media_type="text/event-stream",
+                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    
+    is_meta = is_fittbot_meta_query(text) and not (is_plan_request(text) or is_fitness_related(text))
+    is_plan = is_plan_request(text) or is_fitness_related(text)
 
     await mem.add(user_id, "user", text.strip())
 
@@ -487,6 +257,11 @@ async def chat_stream(
 
     import re as _re
     content = _re.sub(r'\bfit\s*bot\b|\bfit+bot\b|\bfitbot\b', 'Fittbot', content, flags=_re.I)
+    
+    # Remove food logging prompts
+    content = _re.sub(r'Would you like to log more foods.*?\?.*?🍏?', '', content, flags=_re.I | _re.DOTALL)
+    content = _re.sub(r'Let me know.*?log.*?for you.*?🍏?', '', content, flags=_re.I | _re.DOTALL)
+    content = _re.sub(r'Do you want.*?log.*?\?', '', content, flags=_re.I)
 
     pretty  = pretty_plan(content)
     async def _one_shot():
@@ -560,50 +335,19 @@ async def voice_transcribe(
             # fail-safe: return original text as English
             return {"lang":"unknown","english":text}
 
-    # 3) Quick multilingual trigger check
-    LOG_TRIGGERS = {
-        # English
-        "log","add","record","track",
-        # Hindi / Marathi
-        "लॉग","जोड़","जोड","रिकॉर्ड","दर्ज","ऐड","नोंद","नोंदवा",
-        # Tamil
-        "லாக்","சேர்க்க","பதிவு","ரெக்கார்ட்",
-        # Telugu
-        "లాగ్","చేర్చు","నమోదు","రికార్డ్",
-        # Kannada
-        "ಲಾಗ್","ಸೇರಿಸಿ","ದಾಖಲೆ",
-        # Malayalam
-        "ലോഗ്","ചേർക്കുക","രേഖപ്പെടുത്തുക",
-        # Gujarati
-        "લોગ","ઉમેરો","નોંધ",
-        # Bengali
-        "লগ","যোগ","রেকর্ড","নথিভুক্ত",
-        # Punjabi (Gurmukhi)
-        "ਲੋਗ","ਜੋੜੋ","ਦਰਜ","ਰਿਕਾਰਡ",
-        # Urdu
-        "لاگ","شامل","ریکارڈ",
-        # Odia
-        "ଲଗ୍","ଯୋଡନ୍ତୁ","ରେକର୍ଡ",
-    }
-    def _has_multilingual_trigger(s: str) -> bool:
-        t = s.lower()
-        return any(k in t for k in LOG_TRIGGERS)
-
     tinfo = _translate_to_english(transcript)
     transcript_en = tinfo["english"]
     lang_code     = tinfo["lang"]
-    has_trigger   = _has_multilingual_trigger(transcript) or _has_multilingual_trigger(transcript_en)
 
     print("vanakam")
     
-    print(f"[voice] lang={lang_code} raw={transcript!r} | en={transcript_en!r} | trigger={has_trigger}")
+    print(f"[voice] lang={lang_code} raw={transcript!r} | en={transcript_en!r}")
 
-    # Return both raw & translated for the client (optional), plus trigger hint
+    # Return both raw & translated for the client
     return {
         "transcript": transcript_en,
         "lang": lang_code,
         "english": transcript_en,
-        "has_log_or_add": bool(has_trigger),
     }
 
 
