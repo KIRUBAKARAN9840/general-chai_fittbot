@@ -11,7 +11,7 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_CHUNK_TOKENS = 350
 TOP_K            = 4
 
-# ---------- tiny tokenizer ----------
+# ---------- tiny tokenizer ---------- 
 rough_tokens = lambda s: max(1, len(s) // 4)
 
 def chunk_text(text: str, max_tok: int = MAX_CHUNK_TOKENS) -> List[str]:
@@ -425,6 +425,14 @@ GENERAL_SYSTEM = (
     "- CoFounder and head of hr and operations - Mrs.Shama Ara.\n"
     "- CoFounder and CTO - Mr. Naveen Kumar.\n"
     "- CoFounder and IT Strategist - Mr. Martin Raju.\n"
+    "\n"
+    "About Fittbot:\n"
+    "-Fittbot App Features.\n"
+"-Weight & Progress Tracking.\n"
+"-Weight Progress: Users can set their targeted weight and track their progress over time.\n"
+"-Workout Streak: Monitor continuous workout days and maintain consistency.\n"
+"-Transformation View: Users can view their fitness transformation journey with before/after comparisons.\n"
+
 )
 
 COMPARE_POLICY = (
@@ -782,3 +790,5 @@ __all__ = [
     "is_fittbot_meta_query","extract_plan_tokens","is_competitor_compare_query","COMPARE_POLICY",
     "is_food_query","is_fitness_related",
 ]
+
+##################
