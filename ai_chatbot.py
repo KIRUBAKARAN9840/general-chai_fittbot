@@ -1,4 +1,4 @@
-# routes/ai_chatbot.py - Simplified version with food logging redirect
+# routes/ai_chatbot.py - Complete Fixed Version with AI Intent Detection
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Depends
 from fastapi.responses import StreamingResponse
@@ -39,203 +39,58 @@ class KBSearchIn(BaseModel):
     query: str
     k: int = 4
 
-# SIMPLIFIED FOOD DETECTION - Only for redirecting users
+# AI-POWERED INTENT DETECTION FUNCTIONS
 
-def is_food_logging_intent(text: str) -> bool:
-    """Detect if user wants to log food - simplified detection"""
-    if not text:
-        return False
+def detect_user_intent_with_ai(text: str, oai) -> dict:
+    """Use AI to detect user intent for workout plans, diet plans, or food logging"""
     
-    text_lower = text.lower().strip()
+    prompt = f"""
+    Analyze this user message and determine their intent: "{text}"
     
-    # Explicit food logging phrases
-    explicit_logging = [
-        'log food', 'food log', 'add food', 'record food', 'track food',
-        'i ate', 'i had', 'i drank', 'i consumed', 'just ate', 'just had',
-        'ate some', 'had some', 'drank some', 'i finished eating',
-        'breakfast was', 'lunch was', 'dinner was', 'had breakfast',
-        'had lunch', 'had dinner', 'my meal', 'food intake'
-    ]
+    Detect if the user wants:
+    1. WORKOUT_PLAN: workout plans, exercise templates, training routines, gym plans, fitness programs
+    2. DIET_PLAN: diet plans, meal plans, nutrition templates, eating schedules, meal templates  
+    3. FOOD_LOGGING: logging/tracking food they ate/consumed, recording meals, adding food entries
+    4. NONE: not related to the above three intents
     
-    # Check for explicit logging intent
-    if any(phrase in text_lower for phrase in explicit_logging):
-        return True
+    Handle spelling mistakes, different languages, and variations like:
+    - "workoutplan", "work out plan", "excersize plan" → WORKOUT_PLAN
+    - "mealplan", "deit plan", "meal templete" → DIET_PLAN  
+    - "i ate", "log food", "had brekfast" → FOOD_LOGGING
     
-    # Common food words with quantity indicators (likely food logging)
-    food_words = [
-        'rice', 'chicken', 'apple', 'banana', 'bread', 'egg', 'fish', 'milk',
-        'roti', 'chapati', 'idli', 'dosa', 'samosa', 'curry', 'dal', 'biryani',
-        'pizza', 'burger', 'sandwich', 'pasta', 'salad', 'juice', 'coffee', 'tea'
-    ]
+    Return JSON:
+    {{
+        "intent": "WORKOUT_PLAN|DIET_PLAN|FOOD_LOGGING|NONE",
+        "confidence": 0.0-1.0,
+        "detected_phrases": ["list", "of", "key", "phrases", "found"]
+    }}
+    """
     
-    # Look for quantity + food patterns that suggest logging intent
-    quantity_patterns = [
-        r'\d+\s*(?:piece|pieces|slice|slices|plate|plates|bowl|bowls|cup|cups|glass|glasses|gram|grams|kg|ml)?\s*(?:of\s+)?(?:' + '|'.join(food_words) + ')',
-        r'(?:one|two|three|four|five|half|quarter|a)\s+(?:piece|slice|plate|bowl|cup|glass)?\s*(?:of\s+)?(?:' + '|'.join(food_words) + ')',
-        r'\d+\s*(?:' + '|'.join(food_words) + ')',
-        r'(?:' + '|'.join(food_words) + ')\s*\d+'
-    ]
-    
-    for pattern in quantity_patterns:
-        if re.search(pattern, text_lower):
-            return True
-    
-    # Meal context patterns
-    meal_patterns = [
-        r'(?:breakfast|lunch|dinner|snack)\s*(?:was|had|ate|included)?\s*(?:' + '|'.join(food_words) + ')',
-        r'(?:' + '|'.join(food_words) + ')\s*(?:for|as|during)\s*(?:breakfast|lunch|dinner|snack)'
-    ]
-    
-    for pattern in meal_patterns:
-        if re.search(pattern, text_lower):
-            return True
-    
-    return False
-
-def is_workout_plan_intent(text: str) -> bool:
-    """Detect if user wants to create/get a workout plan or workout template"""
-    if not text:
-        return False
-    
-    text_lower = text.lower().strip()
-    print(f"DEBUG is_workout_plan_intent: Checking '{text_lower}'")
-    
-    # Explicit workout plan phrases
-    workout_plan_phrases = [
-        'workout plan', 'workoutplan', 'workout template', 'exercise plan', 
-        'training plan', 'fitness plan', 'gym plan', 'exercise template',
-        'training template', 'fitness template', 'workout routine', 
-        'exercise routine', 'training routine', 'workout schedule',
-        'exercise schedule', 'training schedule', 'workout program',
-        'exercise program', 'training program', 'gym routine',
-        'weekly workout', 'daily workout', 'monthly workout'
-    ]
-    
-    for phrase in workout_plan_phrases:
-        if phrase in text_lower:
-            print(f"DEBUG is_workout_plan_intent: Found phrase '{phrase}' - returning True")
-            return True
-    
-    # Common workout-related requests
-    workout_requests = [
-        'need a workout', 'want a workout', 'need workout', 'want workout',
-        'need exercise plan', 'need training plan', 'need gym plan',
-        'suggest workout', 'recommend workout', 'help with workout',
-        'design workout', 'create workout', 'make workout', 'build workout',
-        'plan my workout', 'plan my training', 'set up workout',
-        'workout for week', 'exercise for week', 'training for week'
-    ]
-    
-    for request in workout_requests:
-        if request in text_lower:
-            print(f"DEBUG is_workout_plan_intent: Found request '{request}' - returning True")
-            return True
-    
-    # Question patterns about workout planning
-    workout_questions = [
-        'how to make workout plan', 'how to create workout', 'where to plan workout',
-        'how to plan exercise', 'how to design workout', 'how to build workout template',
-        'how to start workout', 'where to find workout template'
-    ]
-    
-    for question in workout_questions:
-        if question in text_lower:
-            print(f"DEBUG is_workout_plan_intent: Found question '{question}' - returning True")
-            return True
-    
-    # Goal + workout context
-    if any(goal in text_lower for goal in ['lose weight', 'gain weight', 'muscle gain', 'fat loss', 'build muscle', 'get fit', 'fitness goal']) and \
-       any(workout_word in text_lower for workout_word in ['workout', 'exercise', 'training', 'gym', 'fitness']):
-        print(f"DEBUG is_workout_plan_intent: Found goal + workout context - returning True")
-        return True
-    
-    print(f"DEBUG is_workout_plan_intent: No matches found - returning False")
-    return False
-
-def is_diet_plan_intent(text: str) -> bool:
-    """Detect if user wants to create/get a diet plan or meal template"""
-    if not text:
-        return False
-    
-    text_lower = text.lower().strip()
-    print(f"DEBUG is_diet_plan_intent: Checking '{text_lower}'")
-    
-    # Explicit diet plan phrases
-    diet_plan_phrases = [
-        'diet plan', 'meal plan', 'mealplan', 'diet template', 'meal template', 'food template',
-        'create diet', 'make diet', 'diet chart', 'meal chart', 'nutrition plan',
-        'eating plan', 'food plan', 'diet schedule', 'meal schedule',
-        'weekly diet', 'daily diet', 'monthly diet', 'custom diet',
-        'personalized diet', 'diet program', 'meal program'
-    ]
-    
-    for phrase in diet_plan_phrases:
-        if phrase in text_lower:
-            print(f"DEBUG is_diet_plan_intent: Found phrase '{phrase}' - returning True")
-            return True
-    
-    # Common diet-related requests
-    diet_requests = [
-        'need a diet', 'want a diet', 'need diet', 'want diet',
-        'need a meal', 'need meal', 'need mealplan', 'need a mealplan',
-        'suggest diet', 'recommend diet', 'help with diet', 'design diet', 
-        'plan my meals', 'plan my diet', 'create meal plan', 'make meal plan', 
-        'build diet', 'set up diet'
-    ]
-    
-    for request in diet_requests:
-        if request in text_lower:
-            print(f"DEBUG is_diet_plan_intent: Found request '{request}' - returning True")
-            return True
-    
-    # Question patterns about diet planning
-    diet_questions = [
-        'how to make diet plan', 'how to create diet', 'where to plan diet',
-        'how to plan meals', 'how to design diet', 'how to build diet template'
-    ]
-    
-    for question in diet_questions:
-        if question in text_lower:
-            print(f"DEBUG is_diet_plan_intent: Found question '{question}' - returning True")
-            return True
-    
-    # Weight goal + diet context
-    if any(goal in text_lower for goal in ['lose weight', 'gain weight', 'muscle gain', 'fat loss']) and \
-       any(diet_word in text_lower for diet_word in ['diet', 'meal', 'food', 'eating']):
-        print(f"DEBUG is_diet_plan_intent: Found goal + diet context - returning True")
-        return True
-    
-    print(f"DEBUG is_diet_plan_intent: No matches found - returning False")
-    return False
+    try:
+        response = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an intent classifier. Be very liberal with detecting intents even with spelling mistakes, abbreviations, and different languages. Return only valid JSON."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0
+        )
+        
+        result = response.choices[0].message.content.strip()
+        intent_data = json.loads(result)
+        
+        print(f"DEBUG AI Intent Detection: '{text}' → {intent_data}")
+        return intent_data
+        
+    except Exception as e:
+        print(f"DEBUG AI Intent Detection Error: {e}")
+        return {"intent": "NONE", "confidence": 0.0, "detected_phrases": []}
 
 def is_simple_food_mention(text: str) -> bool:
-    """Detect simple food mentions that might be for logging"""
-    if not text:
-        return False
-    
-    text_lower = text.lower().strip()
-    words = text_lower.split()
-    
-    # Only for very short inputs (1-2 words) and avoid recipe/cooking contexts
-    if len(words) <= 2:
-        common_foods = [
-            'rice', 'chicken', 'apple', 'banana', 'orange', 'milk', 'bread',
-            'egg', 'fish', 'roti', 'chapati', 'idli', 'dosa', 'curry', 'dal',
-            'pizza', 'burger', 'sandwich', 'pasta', 'salad'
-        ]
-        
-        # Exclude cooking/recipe contexts
-        non_logging_contexts = [
-            'recipe', 'cook', 'cooking', 'how to', 'make', 'prepare', 'bake',
-            'nutrition', 'calories', 'healthy', 'benefits', 'vitamin'
-        ]
-        
-        if any(context in text_lower for context in non_logging_contexts):
-            return False
-        
-        return any(food in text_lower for food in common_foods)
-    
-    return False
     """Detect simple food mentions that might be for logging"""
     if not text:
         return False
@@ -315,55 +170,10 @@ async def chat_stream(
     mode = await get_mode(mem, user_id)
 
     print(f"DEBUG: User {user_id} input: '{text}'")
-    print(f"DEBUG: Workout plan intent check: {is_workout_plan_intent(text)}")
-    print(f"DEBUG: Diet plan intent check: {is_diet_plan_intent(text)}")
-    print(f"DEBUG: Food logging intent check: {is_food_logging_intent(text)}")
     print(f"DEBUG: Current pending state: {pend.get('state')}")
 
     if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
-
-    # PRIORITY 1: Check for workout plan intent FIRST - REDIRECT to template section
-    workout_intent = is_workout_plan_intent(text)
-    print(f"DEBUG MAIN: Workout plan intent result: {workout_intent}")
-    
-    if workout_intent:
-        print(f"DEBUG: Workout plan intent detected for: {text}")
-        await mem.set_pending(user_id, {
-            "state": "awaiting_workout_redirect_confirm",
-            "original_text": text.strip()
-        })
-        
-        async def _ask_workout_redirect():
-            redirect_msg = f"I can help you create a personalized workout plan! Would you like me to guide you to the workout template section where you can use our Fittbot default template or make your own template with more customizing options?"
-            await mem.add(user_id, "user", text.strip())
-            await mem.add(user_id, "assistant", redirect_msg)
-            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_redirect_confirm'})}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
-        
-        return StreamingResponse(_ask_workout_redirect(), media_type="text/event-stream",
-                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-    # PRIORITY 2: Check for diet plan intent SECOND - REDIRECT to template section
-    diet_intent = is_diet_plan_intent(text)
-    print(f"DEBUG MAIN: Diet plan intent result: {diet_intent}")
-    
-    if diet_intent:
-        print(f"DEBUG: Diet plan intent detected for: {text}")
-        await mem.set_pending(user_id, {
-            "state": "awaiting_diet_redirect_confirm",
-            "original_text": text.strip()
-        })
-        
-        async def _ask_diet_redirect():
-            redirect_msg = f"I can help you create a personalized diet plan! Would you like me to guide you to the diet template section where you can build your own custom plan or use our Fittbot default template?"
-            await mem.add(user_id, "user", text.strip())
-            await mem.add(user_id, "assistant", redirect_msg)
-            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'diet_redirect_confirm'})}\n\n"
-            yield "event: done\ndata: [DONE]\n\n"
-        
-        return StreamingResponse(_ask_diet_redirect(), media_type="text/event-stream",
-                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
     # Handle analysis confirmation
     if pend.get("state") == "awaiting_analysis_confirm":
@@ -416,11 +226,10 @@ async def chat_stream(
 
     # Handle workout plan confirmation
     if pend.get("state") == "awaiting_workout_redirect_confirm":
-        # Check if this is a yes/no response to the workout plan question
         if is_yes(text):
             await mem.set_pending(user_id, None)
             async def _redirect_to_workout_plan():
-                redirect_message = "Excellent! To create your personalized workout plan, go to: Home → Workout → Here you can find the 'Fittbot default template' for workouts, or choose 'Make your own template' for more customizing options!"
+                redirect_message = "Excellent! To create your personalized workout plan, go to: Home → Workout → Here you can find the 'Kyra default template' for workouts, or choose 'Make your own template' for more customizing options!"
                 await mem.add(user_id, "user", text.strip())
                 await mem.add(user_id, "assistant", redirect_message)
                 yield sse_json({
@@ -436,7 +245,6 @@ async def chat_stream(
             await mem.set_pending(user_id, None)
             # Continue with normal chat - fall through
         elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            # User gave some form of yes/no but not detected by is_yes/is_no functions
             async def _workout_redirect_clarify():
                 clarify_msg = "Would you like me to guide you to the workout template creation section? Please say yes or no."
                 yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
@@ -444,18 +252,15 @@ async def chat_stream(
             return StreamingResponse(_workout_redirect_clarify(), media_type="text/event-stream",
                                      headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         else:
-            # User changed topics - clear the state and process the new message normally
             print(f"DEBUG: Clearing workout redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
-            # Continue with normal processing below
 
     # Handle diet plan confirmation
     if pend.get("state") == "awaiting_diet_redirect_confirm":
-        # Check if this is a yes/no response to the diet plan question
         if is_yes(text):
             await mem.set_pending(user_id, None)
             async def _redirect_to_diet_plan():
-                redirect_message = "Great! To create your personalized diet plan, go to: Home → Diet → Here you can create your own food template or use the 'Fittbot default template' as a starting point!"
+                redirect_message = "Great! To create your personalized diet plan, go to: Home → Diet → Here you can create your own food template or use the 'Kyra default template' as a starting point!"
                 await mem.add(user_id, "user", text.strip())
                 await mem.add(user_id, "assistant", redirect_message)
                 yield sse_json({
@@ -471,7 +276,6 @@ async def chat_stream(
             await mem.set_pending(user_id, None)
             # Continue with normal chat - fall through
         elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            # User gave some form of yes/no but not detected by is_yes/is_no functions
             async def _diet_redirect_clarify():
                 clarify_msg = "Would you like me to guide you to the diet template creation section? Please say yes or no."
                 yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
@@ -479,14 +283,11 @@ async def chat_stream(
             return StreamingResponse(_diet_redirect_clarify(), media_type="text/event-stream",
                                      headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         else:
-            # User changed topics - clear the state and process the new message normally
             print(f"DEBUG: Clearing diet redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
-            # Continue with normal processing below
 
     # Handle food logging confirmation
     if pend.get("state") == "awaiting_food_redirect_confirm":
-        # Check if this is a yes/no response to the food redirect question
         if is_yes(text):
             await mem.set_pending(user_id, None)
             async def _redirect_to_food_log():
@@ -506,7 +307,6 @@ async def chat_stream(
             await mem.set_pending(user_id, None)
             # Continue with normal chat - fall through
         elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            # User gave some form of yes/no but not detected by is_yes/is_no functions
             async def _food_redirect_clarify():
                 clarify_msg = "Would you like me to guide you to the food logging section? Please say yes or no."
                 yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
@@ -514,11 +314,54 @@ async def chat_stream(
             return StreamingResponse(_food_redirect_clarify(), media_type="text/event-stream",
                                      headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         else:
-            # User changed topics - clear the state and process the new message normally
             print(f"DEBUG: Clearing food redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
-            # Continue with normal processing below
-    if is_food_logging_intent(text):
+
+    # AI-powered intent detection - only run if no pending states
+    intent_result = detect_user_intent_with_ai(text, oai)
+    intent_type = intent_result.get("intent", "NONE")
+    confidence = intent_result.get("confidence", 0.0)
+    
+    print(f"DEBUG AI Intent: {intent_type} (confidence: {confidence})")
+
+    # PRIORITY 1: Check for workout plan intent
+    if intent_type == "WORKOUT_PLAN" and confidence > 0.6:
+        print(f"DEBUG: Workout plan intent detected for: {text}")
+        await mem.set_pending(user_id, {
+            "state": "awaiting_workout_redirect_confirm",
+            "original_text": text.strip()
+        })
+        
+        async def _ask_workout_redirect():
+            redirect_msg = "I can help you create a personalized workout plan! Would you like me to guide you to the workout template section where you can use our Kyra default template or make your own template with more customizing options?"
+            await mem.add(user_id, "user", text.strip())
+            await mem.add(user_id, "assistant", redirect_msg)
+            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_redirect_confirm'})}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        
+        return StreamingResponse(_ask_workout_redirect(), media_type="text/event-stream",
+                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # PRIORITY 2: Check for diet plan intent
+    elif intent_type == "DIET_PLAN" and confidence > 0.6:
+        print(f"DEBUG: Diet plan intent detected for: {text}")
+        await mem.set_pending(user_id, {
+            "state": "awaiting_diet_redirect_confirm",
+            "original_text": text.strip()
+        })
+        
+        async def _ask_diet_redirect():
+            redirect_msg = "I can help you create a personalized diet plan! Would you like me to guide you to the diet template section where you can build your own custom plan or use our Kyra default template?"
+            await mem.add(user_id, "user", text.strip())
+            await mem.add(user_id, "assistant", redirect_msg)
+            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'diet_redirect_confirm'})}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        
+        return StreamingResponse(_ask_diet_redirect(), media_type="text/event-stream",
+                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # PRIORITY 3: Check for food logging intent
+    elif intent_type == "FOOD_LOGGING" and confidence > 0.6:
         print(f"DEBUG: Food logging intent detected for: {text}")
         await mem.set_pending(user_id, {
             "state": "awaiting_food_redirect_confirm",
@@ -526,7 +369,7 @@ async def chat_stream(
         })
         
         async def _ask_food_redirect():
-            redirect_msg = f"I noticed you want to log food! For the best experience with food logging, scanning, and nutrition tracking, would you like me to guide you to the dedicated food logging section?"
+            redirect_msg = "I noticed you want to log food! For the best experience with food logging, scanning, and nutrition tracking, would you like me to guide you to the dedicated food logging section?"
             await mem.add(user_id, "user", text.strip())
             await mem.add(user_id, "assistant", redirect_msg)
             yield f"data: {json.dumps({'message': redirect_msg, 'type': 'food_redirect_confirm'})}\n\n"
@@ -535,6 +378,7 @@ async def chat_stream(
         return StreamingResponse(_ask_food_redirect(), media_type="text/event-stream",
                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
     
+    # Fallback: Check for simple food mentions
     elif is_simple_food_mention(text):
         print(f"DEBUG: Simple food mention detected for: {text}")
         await mem.set_pending(user_id, {
@@ -551,14 +395,6 @@ async def chat_stream(
         
         return StreamingResponse(_ask_simple_food_redirect(), media_type="text/event-stream",
                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-    # Clear any food-related pending state if user moves to other topics
-    if pend.get("state") == "awaiting_food_redirect_confirm":
-        # Only clear if the current message is NOT a yes/no response
-        if not (is_yes(text) or is_no(text) or 
-                any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah'])):
-            print(f"DEBUG: Clearing food redirect state due to topic change to: {text}")
-            await mem.set_pending(user_id, None)
 
     # Continue with existing analysis and normal chat logic
     if mode == "analysis" and not is_plan_request(tlower):
@@ -599,17 +435,37 @@ async def chat_stream(
         return StreamingResponse(_ask_confirm(), media_type="text/event-stream",
                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-    # Regular chat processing
+    # Regular chat processing with friendly responses
     print(f"DEBUG: Processing as regular fitness chat")
     
     if not is_fitness_related(text) and not is_fittbot_meta_query(text):
-        async def _not_fitness():
-            redirect_msg = "I'm a specialized fitness assistant and can only help with exercise, health, and wellness topics. How can I help you with your fitness journey today?"
-            yield sse_escape(redirect_msg)
+        # Check if it's a greeting or personal question
+        greetings_and_personal = [
+            'hi', 'hello', 'hey', 'how are you', 'how do you do', 'whats up', 'what\'s up',
+            'good morning', 'good afternoon', 'good evening', 'your name', 'who are you',
+            'what are you', 'introduce yourself', 'tell me about yourself'
+        ]
+        
+        is_greeting_or_personal = any(greeting in text.lower() for greeting in greetings_and_personal)
+        
+        async def _friendly_redirect():
+            if is_greeting_or_personal:
+                if any(greeting in text.lower() for greeting in ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening']):
+                    friendly_msg = "Hello! I'm Kyra, your friendly fitness assistant. I'm here to help you with workouts, nutrition, diet planning, and all things fitness. What would you like to work on today?"
+                elif 'how are you' in text.lower():
+                    friendly_msg = "I'm doing great, thanks for asking! I'm excited to help you with your fitness journey. Whether you need workout plans, diet advice, or nutrition guidance, I'm here for you. What can I help you with?"
+                elif any(name_q in text.lower() for name_q in ['your name', 'who are you', 'what are you']):
+                    friendly_msg = "I'm Kyra, your dedicated fitness companion! I specialize in helping people achieve their health and fitness goals through personalized workout plans, nutrition guidance, and wellness tips. How can I support your fitness journey?"
+                else:
+                    friendly_msg = "Hi there! I'm Kyra, and I'm passionate about helping you with fitness, nutrition, and wellness. Whether you want to build muscle, lose weight, plan meals, or just get healthier, I'm here to guide you. What fitness goal are you working towards?"
+            else:
+                friendly_msg = "I focus on fitness, health, and wellness topics to give you the best guidance possible! Whether you need workout routines, nutrition advice, meal planning, or health tips, I'm here to help. What aspect of your fitness journey can I assist with today?"
+            
+            yield sse_escape(friendly_msg)
             await mem.add(user_id, "user", text.strip())
-            await mem.add(user_id, "assistant", redirect_msg)
+            await mem.add(user_id, "assistant", friendly_msg)
             yield "event: done\ndata: [DONE]\n\n"
-        return StreamingResponse(_not_fitness(), media_type="text/event-stream",
+        return StreamingResponse(_friendly_redirect(), media_type="text/event-stream",
                                  headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
     
     is_meta = is_fittbot_meta_query(text) and not (is_plan_request(text) or is_fitness_related(text))
@@ -631,7 +487,17 @@ async def chat_stream(
     resp = oai.chat.completions.create(model=OPENAI_MODEL, messages=msgs, stream=False, temperature=temperature)
     content = (resp.choices[0].message.content or "").strip()
 
-    content = re.sub(r'\bfit\s*bot\b|\bfit+bot\b|\bfitbot\b', 'Fittbot', content, flags=re.I)
+    # Fix brand name confusion - Kyra is AI, Fittbot is app
+    content = re.sub(r'\bfit\s*bot\b|\bfit+bot\b', 'Fittbot', content, flags=re.I)
+    content = re.sub(r'\bfitbot\b', 'Fittbot', content, flags=re.I)
+    
+    # Don't replace Kyra with Fittbot when talking about the AI
+    # But do replace wrong usage like "About Kyra" when user asks about Fittbot
+    if 'fittbot' in text.lower() and 'about kyra' in content.lower():
+        content = re.sub(r'\bAbout Kyra\b', 'About Fittbot', content, flags=re.I)
+        content = re.sub(r'\bKyra is a comprehensive fitness app\b', 'Fittbot is a comprehensive fitness app', content, flags=re.I)
+        content = re.sub(r'\bKyra is perfect for\b', 'Fittbot is perfect for', content, flags=re.I)
+    
     content = re.sub(r'Would you like to log more foods.*?\?.*?🍏?', '', content, flags=re.I | re.DOTALL)
     content = re.sub(r'Let me know.*?log.*?for you.*?🍏?', '', content, flags=re.I | re.DOTALL)
     content = re.sub(r'Do you want.*?log.*?\?', '', content, flags=re.I)
@@ -644,7 +510,7 @@ async def chat_stream(
     return StreamingResponse(_one_shot(), media_type="text/event-stream",
                              headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-# Keep all your existing endpoints
+# Keep all existing endpoints
 @router.post("/kb/upsert")
 async def kb_upsert(inp: KBUpsertIn):
     return {"added_chunks": KB.upsert(inp.source, inp.text)}
