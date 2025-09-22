@@ -92,6 +92,66 @@ def is_food_logging_intent(text: str) -> bool:
     
     return False
 
+def is_workout_plan_intent(text: str) -> bool:
+    """Detect if user wants to create/get a workout plan or workout template"""
+    if not text:
+        return False
+    
+    text_lower = text.lower().strip()
+    print(f"DEBUG is_workout_plan_intent: Checking '{text_lower}'")
+    
+    # Explicit workout plan phrases
+    workout_plan_phrases = [
+        'workout plan', 'workoutplan', 'workout template', 'exercise plan', 
+        'training plan', 'fitness plan', 'gym plan', 'exercise template',
+        'training template', 'fitness template', 'workout routine', 
+        'exercise routine', 'training routine', 'workout schedule',
+        'exercise schedule', 'training schedule', 'workout program',
+        'exercise program', 'training program', 'gym routine',
+        'weekly workout', 'daily workout', 'monthly workout'
+    ]
+    
+    for phrase in workout_plan_phrases:
+        if phrase in text_lower:
+            print(f"DEBUG is_workout_plan_intent: Found phrase '{phrase}' - returning True")
+            return True
+    
+    # Common workout-related requests
+    workout_requests = [
+        'need a workout', 'want a workout', 'need workout', 'want workout',
+        'need exercise plan', 'need training plan', 'need gym plan',
+        'suggest workout', 'recommend workout', 'help with workout',
+        'design workout', 'create workout', 'make workout', 'build workout',
+        'plan my workout', 'plan my training', 'set up workout',
+        'workout for week', 'exercise for week', 'training for week'
+    ]
+    
+    for request in workout_requests:
+        if request in text_lower:
+            print(f"DEBUG is_workout_plan_intent: Found request '{request}' - returning True")
+            return True
+    
+    # Question patterns about workout planning
+    workout_questions = [
+        'how to make workout plan', 'how to create workout', 'where to plan workout',
+        'how to plan exercise', 'how to design workout', 'how to build workout template',
+        'how to start workout', 'where to find workout template'
+    ]
+    
+    for question in workout_questions:
+        if question in text_lower:
+            print(f"DEBUG is_workout_plan_intent: Found question '{question}' - returning True")
+            return True
+    
+    # Goal + workout context
+    if any(goal in text_lower for goal in ['lose weight', 'gain weight', 'muscle gain', 'fat loss', 'build muscle', 'get fit', 'fitness goal']) and \
+       any(workout_word in text_lower for workout_word in ['workout', 'exercise', 'training', 'gym', 'fitness']):
+        print(f"DEBUG is_workout_plan_intent: Found goal + workout context - returning True")
+        return True
+    
+    print(f"DEBUG is_workout_plan_intent: No matches found - returning False")
+    return False
+
 def is_diet_plan_intent(text: str) -> bool:
     """Detect if user wants to create/get a diet plan or meal template"""
     if not text:
@@ -255,6 +315,7 @@ async def chat_stream(
     mode = await get_mode(mem, user_id)
 
     print(f"DEBUG: User {user_id} input: '{text}'")
+    print(f"DEBUG: Workout plan intent check: {is_workout_plan_intent(text)}")
     print(f"DEBUG: Diet plan intent check: {is_diet_plan_intent(text)}")
     print(f"DEBUG: Food logging intent check: {is_food_logging_intent(text)}")
     print(f"DEBUG: Current pending state: {pend.get('state')}")
@@ -262,7 +323,28 @@ async def chat_stream(
     if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
 
-    # PRIORITY: Check for diet plan intent FIRST - REDIRECT to template section
+    # PRIORITY 1: Check for workout plan intent FIRST - REDIRECT to template section
+    workout_intent = is_workout_plan_intent(text)
+    print(f"DEBUG MAIN: Workout plan intent result: {workout_intent}")
+    
+    if workout_intent:
+        print(f"DEBUG: Workout plan intent detected for: {text}")
+        await mem.set_pending(user_id, {
+            "state": "awaiting_workout_redirect_confirm",
+            "original_text": text.strip()
+        })
+        
+        async def _ask_workout_redirect():
+            redirect_msg = f"I can help you create a personalized workout plan! Would you like me to guide you to the workout template section where you can use our Fittbot default template or make your own template with more customizing options?"
+            await mem.add(user_id, "user", text.strip())
+            await mem.add(user_id, "assistant", redirect_msg)
+            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_redirect_confirm'})}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        
+        return StreamingResponse(_ask_workout_redirect(), media_type="text/event-stream",
+                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # PRIORITY 2: Check for diet plan intent SECOND - REDIRECT to template section
     diet_intent = is_diet_plan_intent(text)
     print(f"DEBUG MAIN: Diet plan intent result: {diet_intent}")
     
@@ -331,6 +413,41 @@ async def chat_stream(
             yield "event: done\ndata: [DONE]\n\n"
         return StreamingResponse(_nav_clar(), media_type="text/event-stream",
                                  headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # Handle workout plan confirmation
+    if pend.get("state") == "awaiting_workout_redirect_confirm":
+        # Check if this is a yes/no response to the workout plan question
+        if is_yes(text):
+            await mem.set_pending(user_id, None)
+            async def _redirect_to_workout_plan():
+                redirect_message = "Excellent! To create your personalized workout plan, go to: Home → Workout → Here you can find the 'Fittbot default template' for workouts, or choose 'Make your own template' for more customizing options!"
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", redirect_message)
+                yield sse_json({
+                    "type": "workout_plan_redirect",
+                    "redirect": True,
+                    "message": redirect_message,
+                    "navigation_path": "Home → Workout → Templates"
+                })
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_redirect_to_workout_plan(), media_type="text/event-stream",
+                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        elif is_no(text):
+            await mem.set_pending(user_id, None)
+            # Continue with normal chat - fall through
+        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
+            # User gave some form of yes/no but not detected by is_yes/is_no functions
+            async def _workout_redirect_clarify():
+                clarify_msg = "Would you like me to guide you to the workout template creation section? Please say yes or no."
+                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_workout_redirect_clarify(), media_type="text/event-stream",
+                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        else:
+            # User changed topics - clear the state and process the new message normally
+            print(f"DEBUG: Clearing workout redirect state due to topic change to: {text}")
+            await mem.set_pending(user_id, None)
+            # Continue with normal processing below
 
     # Handle diet plan confirmation
     if pend.get("state") == "awaiting_diet_redirect_confirm":
