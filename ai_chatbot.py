@@ -191,12 +191,15 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
        - Handle typos: "deit plan", "meal templete", "mealplan"
        - NOT: "nutrition facts", "food benefits", "calories in apple", "what to eat"
     
-    3. FOOD_LOGGING: User wants to LOG/TRACK/RECORD food they ate/consumed
-       - Examples: "log apple", "I ate rice", "track my breakfast", "add food to diary"
-       - NOT: "apple nutrition", "benefits of rice", "how many calories"
+    3. FOOD_LOGGING: User wants to LOG/TRACK/RECORD food they ate/consumed - BE VERY LIBERAL HERE
+       - Examples: "log apple", "I ate rice", "track my breakfast", "add food to diary", "I had chicken", "ate pizza", "consumed banana"
+       - Key phrases: "I ate", "I had", "I consumed", "I finished", "just ate", "just had"
+       - BE GENEROUS: If someone mentions eating/having/consuming food, it's likely logging intent
+       - NOT: "apple nutrition", "benefits of rice", "how many calories" (these are info requests)
     
     4. WORKOUT_LOGGING: User wants to LOG/SAVE/RECORD exercises they did
-       - Examples: "log my workout", "I did pushups", "save exercise", "record training"
+       - Examples: "log my workout", "I did pushups", "save exercise", "record training", "I completed", "just finished workout"
+       - Key phrases: "I did", "I completed", "I finished", "just did", "done with"
        - NOT: "how to do exercise", "workout tips", "exercise benefits"
     
     5. NONE: General questions, information requests, nutrition facts, exercise tips, etc.
@@ -205,9 +208,8 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
     - Information/question requests → NONE
     - Nutrition facts/benefits → NONE  
     - Exercise instructions/tips → NONE
-    - Only detect intent if user wants to CREATE, GET, or LOG something
-    - Be very liberal with detecting plan creation intents (workout/diet plans)
-    - Handle spelling mistakes and typos generously
+    - BE VERY LIBERAL with logging detection - if someone says they ate/did something, assume they want to log it
+    - Past tense eating/exercise = likely logging intent
     - Words like "tell", "give", "show", "provide" + "plan" = plan creation intent
     
     Return JSON:
@@ -521,11 +523,13 @@ async def chat_stream(
         print(f"DEBUG has_action: {has_action}, is_fitness: {is_fitness_question}")
         
         # Use different confidence thresholds for different intent types
-        # More liberal for plan creation, stricter for logging
+        # More liberal for plan creation and logging
         if intent_type in ["WORKOUT_PLAN", "DIET_PLAN"]:
             min_confidence = 0.7  # Lower threshold for plan creation
+        elif intent_type in ["FOOD_LOGGING", "WORKOUT_LOGGING"]:
+            min_confidence = 0.6  # Even lower threshold for logging (since these are important)
         else:
-            min_confidence = 0.8  # Higher threshold for logging
+            min_confidence = 0.8  # Higher threshold for other intents
         
         # PRIORITY 1: Check for workout plan intent
         if intent_type == "WORKOUT_PLAN" and confidence > min_confidence and action_detected:
