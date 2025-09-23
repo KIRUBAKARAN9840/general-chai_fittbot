@@ -42,7 +42,7 @@ class KBSearchIn(BaseModel):
 # AI-POWERED INTENT DETECTION FUNCTIONS
 
 def detect_user_intent_with_ai(text: str, oai) -> dict:
-    """Use AI to detect user intent for workout plans, diet plans, or food logging"""
+    """Use AI to detect user intent for workout plans, diet plans, food logging, or workout logging"""
     
     prompt = f"""
     Analyze this user message and determine their intent: "{text}"
@@ -51,16 +51,18 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
     1. WORKOUT_PLAN: workout plans, exercise templates, training routines, gym plans, fitness programs
     2. DIET_PLAN: diet plans, meal plans, nutrition templates, eating schedules, meal templates  
     3. FOOD_LOGGING: logging/tracking food they ate/consumed, recording meals, adding food entries
-    4. NONE: not related to the above three intents
+    4. WORKOUT_LOGGING: logging/saving exercises they did, recording workouts, tracking exercise sessions
+    5. NONE: not related to the above four intents
     
     Handle spelling mistakes, different languages, and variations like:
     - "workoutplan", "work out plan", "excersize plan" → WORKOUT_PLAN
     - "mealplan", "deit plan", "meal templete" → DIET_PLAN  
     - "i ate", "log food", "had brekfast" → FOOD_LOGGING
+    - "i did pushups", "log workout", "save exercise", "done training" → WORKOUT_LOGGING
     
     Return JSON:
     {{
-        "intent": "WORKOUT_PLAN|DIET_PLAN|FOOD_LOGGING|NONE",
+        "intent": "WORKOUT_PLAN|DIET_PLAN|FOOD_LOGGING|WORKOUT_LOGGING|NONE",
         "confidence": 0.0-1.0,
         "detected_phrases": ["list", "of", "key", "phrases", "found"]
     }}
@@ -317,6 +319,37 @@ async def chat_stream(
             print(f"DEBUG: Clearing food redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
 
+    # Handle workout logging confirmation
+    if pend.get("state") == "awaiting_workout_log_redirect_confirm":
+        if is_yes(text):
+            await mem.set_pending(user_id, None)
+            async def _redirect_to_workout_log():
+                redirect_message = "Great! To log your workout, go to: Home → Workout → Here you can find your templates and log exercises in your existing template, or create a new workout template!"
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", redirect_message)
+                yield sse_json({
+                    "type": "workout_log_redirect",
+                    "redirect": True,
+                    "message": redirect_message,
+                    "navigation_path": "Home → Workout → Templates & Logging"
+                })
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_redirect_to_workout_log(), media_type="text/event-stream",
+                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        elif is_no(text):
+            await mem.set_pending(user_id, None)
+            # Continue with normal chat - fall through
+        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
+            async def _workout_log_redirect_clarify():
+                clarify_msg = "Would you like me to guide you to the workout logging section? Please say yes or no."
+                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_workout_log_redirect_clarify(), media_type="text/event-stream",
+                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        else:
+            print(f"DEBUG: Clearing workout log redirect state due to topic change to: {text}")
+            await mem.set_pending(user_id, None)
+
     # AI-powered intent detection - only run if no pending states
     intent_result = detect_user_intent_with_ai(text, oai)
     intent_type = intent_result.get("intent", "NONE")
@@ -376,6 +409,24 @@ async def chat_stream(
             yield "event: done\ndata: [DONE]\n\n"
         
         return StreamingResponse(_ask_food_redirect(), media_type="text/event-stream",
+                                headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # PRIORITY 4: Check for workout logging intent
+    elif intent_type == "WORKOUT_LOGGING" and confidence > 0.6:
+        print(f"DEBUG: Workout logging intent detected for: {text}")
+        await mem.set_pending(user_id, {
+            "state": "awaiting_workout_log_redirect_confirm",
+            "original_text": text.strip()
+        })
+        
+        async def _ask_workout_log_redirect():
+            redirect_msg = "I see you want to log your workout! Would you like me to guide you to the workout logging section where you can track your exercises in your templates?"
+            await mem.add(user_id, "user", text.strip())
+            await mem.add(user_id, "assistant", redirect_msg)
+            yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_log_redirect_confirm'})}\n\n"
+            yield "event: done\ndata: [DONE]\n\n"
+        
+        return StreamingResponse(_ask_workout_log_redirect(), media_type="text/event-stream",
                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
     
     # Fallback: Check for simple food mentions
