@@ -20,6 +20,55 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.llm_helpers i
 
 # Import specialized chatbot functionalities
 from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate, ClientDietTemplate, MealTemplate, ActualDiet, ClientTarget
+
+# Import workout template chatbot components
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import (
+    enhanced_edit_template, SmartWorkoutEditor, extract_bulk_operation_info,
+    render_markdown_from_template, llm_generate_template_from_profile,
+    llm_edit_template, explain_template_with_llm, DAYS6, build_id_only_structure
+)
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_structured import (
+    StructurizeAndSaveRequest, structurize_and_save
+)
+
+# Import workout template chatbot classes (we'll need to copy them here or import directly)
+# For now, let's import the main function directly
+import importlib.util
+import sys
+
+def import_workout_template_function():
+    """Import the ultra_flexible_workout_stream function"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "workout_template_chatbot",
+            "/Users/admin/Desktop/fittbot_test/Combined backend 24092025/app/fittbot_api/v1/client/client_api/chatbot/codes/workout_template_chatbot.py"
+        )
+        workout_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workout_module)
+        return workout_module.ultra_flexible_workout_stream
+    except Exception as e:
+        print(f"Failed to import workout template function: {e}")
+        return None
+
+# Import the workout template function
+ultra_flexible_workout_stream = import_workout_template_function()
+
+def import_food_template_function():
+    """Import the food template chat_stream function"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "food_template_chatbot",
+            "/Users/admin/Desktop/fittbot_test/Combined backend 24092025/app/fittbot_api/v1/client/client_api/chatbot/codes/food_template.py"
+        )
+        food_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(food_module)
+        return food_module.chat_stream
+    except Exception as e:
+        print(f"Failed to import food template function: {e}")
+        return None
+
+# Import the food template function
+food_template_chat_stream = import_food_template_function()
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.report_analysis import (
     is_analysis_intent, is_followup_question, set_mode, get_mode,
     set_analysis_artifacts, get_analysis_artifacts, build_analysis_dataset_dict,
@@ -911,6 +960,59 @@ async def chat_stream(
     print(f"DEBUG: User {user_id} input: '{text}'")
     print(f"DEBUG: Current pending state: {pend.get('state')}")
 
+    # ============================================================================
+    # CHECK FOR ONGOING SPECIALIZED CHATBOT CONVERSATIONS
+    # ============================================================================
+
+    # Check if we're in the middle of a workout template conversation
+    current_state = pend.get('state', '')
+
+    # Workout template chatbot states (from workout_template_chatbot.py + custom controlled flow)
+    workout_template_states = [
+        'start', 'fetch_profile', 'ask_days', 'ask_names', 'draft_generation',
+        'edit_decision', 'apply_edit', 'confirm_save', 'done', 'SHOW_TEMPLATE',
+        'controlled_ask_days', 'controlled_ask_names', 'controlled_generate'
+    ]
+
+    # Food template chatbot states (from food_template.py)
+    food_template_states = [
+        'awaiting_diet_preference', 'awaiting_cuisine_preference',
+        'awaiting_confirmation', 'template_ready', 'awaiting_edit_request'
+    ]
+
+    if current_state in workout_template_states:
+        print(f"DEBUG: Continuing workout template conversation in state: {current_state}")
+        if ultra_flexible_workout_stream:
+            try:
+                return await ultra_flexible_workout_stream(
+                    user_id=user_id,
+                    text=text,
+                    mem=mem,
+                    oai=oai,
+                    db=db
+                )
+            except Exception as e:
+                print(f"Error continuing workout template conversation: {e}")
+                # Clear the state and continue with normal chat
+                await mem.set_pending(user_id, None)
+
+    elif current_state in food_template_states:
+        print(f"DEBUG: Continuing food template conversation in state: {current_state}")
+        if food_template_chat_stream:
+            try:
+                return await food_template_chat_stream(
+                    user_id=user_id,
+                    client_id=user_id,
+                    text=text,
+                    mem=mem,
+                    oai=oai,
+                    db=db
+                )
+            except Exception as e:
+                print(f"Error continuing food template conversation: {e}")
+                # Clear the state and continue with normal chat
+                await mem.set_pending(user_id, None)
+
     if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
 
@@ -1176,6 +1278,154 @@ async def chat_stream(
             return StreamingResponse(_quantity_error(), media_type="text/event-stream",
                                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
+    # ============================================================================
+    # CONTROLLED WORKOUT TEMPLATE CONVERSATION HANDLERS
+    # ============================================================================
+
+    # Handle controlled workout template flow - asking for days
+    if pend.get("state") == "ask_days" and pend.get("chatbot_type") == "workout_template":
+        print("DEBUG: In controlled workout template ask_days state")
+        try:
+            # Parse days from user input
+            days_text = text.lower().strip()
+            days_count = None
+
+            # Simple number extraction
+            import re
+            number_match = re.search(r'\b(\d+)\b', days_text)
+            if number_match:
+                days_count = int(number_match.group(1))
+                if not (3 <= days_count <= 7):  # Validate range
+                    days_count = None
+
+            if days_count:
+                print(f"DEBUG: Parsed {days_count} days from user input")
+
+                profile = pend.get("profile", {})
+                profile["days_count"] = days_count
+
+                # Move to ask names state
+                await mem.set_pending(user_id, {
+                    "state": "controlled_ask_names",
+                    "profile": profile,
+                    "chatbot_type": "workout_template"
+                })
+
+                # Ask for workout names
+                day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"][:days_count]
+                message = f"""🎯 Perfect! {days_count} workout days it is!
+
+Now, what would you like to focus on for each day? You can either:
+
+1. **Tell me specific muscle groups**: e.g., "Chest, Back, Legs, Arms, Shoulders, Cardio"
+2. **Use day names**: e.g., "Monday, Tuesday, Wednesday, Thursday, Friday"
+3. **Say 'default'** and I'll create a balanced split for you
+
+What would you prefer for your {days_count} workout days?"""
+
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", message)
+
+                async def _ask_names():
+                    yield sse_json({
+                        "type": "workout_template",
+                        "status": "ask_names",
+                        "message": message
+                    })
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_ask_names(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                # Ask again for valid days
+                message = "Please enter a valid number of workout days between 3 and 7. For example: '5' or '6 days'"
+
+                async def _ask_days_again():
+                    yield sse_escape(message)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_ask_days_again(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+        except Exception as e:
+            print(f"Error in controlled ask_days: {e}")
+            await mem.set_pending(user_id, None)
+            async def _error():
+                yield sse_escape("Something went wrong. Please start over by saying 'I need workout template'")
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_error(), media_type="text/event-stream",
+                                   headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+    # Handle controlled workout template flow - asking for names
+    if pend.get("state") == "controlled_ask_names" and pend.get("chatbot_type") == "workout_template":
+        print("DEBUG: In controlled workout template ask_names state")
+        try:
+            profile = pend.get("profile", {})
+            days_count = profile.get("days_count", 6)
+
+            # Generate workout template using the original function
+            workout_template = generate_workout_template_with_ai(f"Create {days_count} day workout plan focusing on: {text}", profile, oai)
+
+            if workout_template:
+                # Clear the state
+                await mem.set_pending(user_id, None)
+
+                # Auto-save the template to database
+                try:
+                    # Save to WorkoutTemplate table
+                    new_template = WorkoutTemplate(
+                        client_id=user_id,
+                        template_name=workout_template.get('template_name', f'{days_count}-Day Workout'),
+                        template_json=workout_template,
+                        is_active=True
+                    )
+                    db.add(new_template)
+                    db.commit()
+                    print(f"DEBUG: Saved workout template to database with ID: {new_template.id}")
+
+                except Exception as save_error:
+                    print(f"WARNING: Failed to save to database: {save_error}")
+                    db.rollback()
+
+                # Format and display the template
+                formatted_template = format_workout_template_display(workout_template)
+                response_message = f"🏋️ Your personalized {days_count}-day workout template is ready and saved!\n\n{formatted_template}\n\n✅ Template saved successfully! You can now use this template for your workouts."
+
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", response_message)
+
+                async def _show_template():
+                    yield sse_json({
+                        "type": "workout_template",
+                        "status": "template_saved",
+                        "template": workout_template,
+                        "message": response_message
+                    })
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_show_template(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                # Generation failed
+                await mem.set_pending(user_id, None)
+                error_msg = "I encountered an issue generating your workout template. Please try again."
+
+                async def _gen_error():
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_gen_error(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+        except Exception as e:
+            print(f"Error in controlled ask_names: {e}")
+            await mem.set_pending(user_id, None)
+            async def _error():
+                yield sse_escape("Something went wrong generating your template. Please start over.")
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_error(), media_type="text/event-stream",
+                                   headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
     # Handle workout logging confirmation
     if pend.get("state") == "awaiting_workout_log_redirect_confirm":
         if is_yes(text):
@@ -1274,105 +1524,101 @@ async def chat_stream(
         print(f"DEBUG Will trigger: {intent_type in ['WORKOUT_PLAN', 'DIET_PLAN', 'FOOD_LOGGING', 'WORKOUT_LOGGING'] and confidence > min_confidence}")
 
         
-        # PRIORITY 1: Check for workout plan intent - HANDLE DIRECTLY
+        # PRIORITY 1: Check for workout plan intent - USE CONTROLLED WORKOUT TEMPLATE FLOW
         if intent_type == "WORKOUT_PLAN" and confidence > min_confidence:
             print(f"DEBUG: Workout plan intent detected for: {text}")
+            print(f"DEBUG: Starting controlled workout template conversation...")
 
-            async def _generate_workout_plan():
+            async def _controlled_workout_flow():
                 try:
                     await mem.add(user_id, "user", text.strip())
 
-                    # Get user profile
+                    # Always start with asking for days (force conversation flow)
                     profile = fetch_client_profile(db, user_id)
-                    print(f"DEBUG: User profile fetched: {profile}")
+                    print(f"DEBUG: Profile fetched: {profile}")
 
-                    # Generate workout template
-                    print(f"DEBUG: Generating workout template with AI...")
-                    workout_template = generate_workout_template_with_ai(text, profile, oai)
-                    print(f"DEBUG: Workout template generated: {workout_template is not None}")
+                    # Set initial state
+                    await mem.set_pending(user_id, {
+                        "state": "ask_days",
+                        "profile": profile,
+                        "chatbot_type": "workout_template"
+                    })
 
-                    if workout_template:
-                        # Format the template for display
-                        formatted_template = format_workout_template_display(workout_template)
+                    # Ask for days
+                    message = f"""🏋️ Let's create your personalized workout template!
 
-                        response_message = f"🏋️ I've created a personalized workout template for you!\n\n{formatted_template}\n\n💡 This template is based on your profile and goals. You can modify it anytime by asking me to adjust specific exercises, sets, or reps!"
+I can see your profile:
+• Current Weight: {profile['current_weight']} kg
+• Target Weight: {profile['target_weight']} kg
+• Goal: {profile['client_goal']}
 
-                        await mem.add(user_id, "assistant", response_message)
+How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
 
-                        # Send response with template data
-                        yield sse_json({
-                            "type": "workout_template",
-                            "template": workout_template,
-                            "message": response_message
-                        })
-                    else:
-                        error_msg = "I encountered an issue generating your workout plan. Let me help you with general workout advice instead."
-                        await mem.add(user_id, "assistant", error_msg)
-                        yield sse_escape(error_msg)
+                    await mem.add(user_id, "assistant", message)
 
+                    yield sse_json({
+                        "type": "workout_template",
+                        "status": "ask_days",
+                        "message": message
+                    })
                     yield "event: done\ndata: [DONE]\n\n"
 
                 except Exception as e:
-                    print(f"Error generating workout plan: {e}")
+                    print(f"Error starting controlled workout flow: {e}")
                     import traceback
                     print(f"Full traceback: {traceback.format_exc()}")
-                    error_msg = "I encountered an issue generating your workout plan. Let me help you with general workout advice instead."
+
+                    error_msg = "I encountered an issue starting the workout planner. Let me help you with general workout advice instead."
                     await mem.add(user_id, "assistant", error_msg)
                     yield sse_escape(error_msg)
                     yield "event: done\ndata: [DONE]\n\n"
 
-            return StreamingResponse(_generate_workout_plan(), media_type="text/event-stream",
+            return StreamingResponse(_controlled_workout_flow(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        # PRIORITY 2: Check for diet plan intent - HANDLE DIRECTLY
+        # PRIORITY 2: Check for diet plan intent - USE FULL FOOD TEMPLATE CHATBOT
         elif intent_type == "DIET_PLAN" and confidence > min_confidence:
             print(f"DEBUG: Diet plan intent detected for: {text}")
+            print(f"DEBUG: Delegating to full food template chatbot...")
 
-            async def _generate_diet_plan():
+            if food_template_chat_stream:
                 try:
-                    await mem.add(user_id, "user", text.strip())
-
-                    # Get user profile
-                    profile = fetch_client_profile(db, user_id)
-                    print(f"DEBUG: User profile fetched for diet: {profile}")
-
-                    # Generate diet template
-                    print(f"DEBUG: Generating diet template with AI...")
-                    diet_template = generate_diet_template_with_ai(text, profile, oai)
-                    print(f"DEBUG: Diet template generated: {diet_template is not None}")
-
-                    if diet_template:
-                        # Format the template for display
-                        formatted_template = format_diet_template_display(diet_template)
-
-                        response_message = f"🍽️ I've created a personalized diet template for you!\n\n{formatted_template}\n\n💡 This diet plan is tailored to your goals and calorie needs. You can modify it anytime by asking me to adjust meals or portions!"
-
-                        await mem.add(user_id, "assistant", response_message)
-
-                        # Send response with template data
-                        yield sse_json({
-                            "type": "diet_template",
-                            "template": diet_template,
-                            "message": response_message
-                        })
-                    else:
-                        error_msg = "I encountered an issue generating your diet plan. Let me help you with general nutrition advice instead."
-                        await mem.add(user_id, "assistant", error_msg)
-                        yield sse_escape(error_msg)
-
-                    yield "event: done\ndata: [DONE]\n\n"
-
+                    # Use the full food template chatbot functionality
+                    print(f"DEBUG: Calling food_template_chat_stream with user_id={user_id}, client_id={user_id}, text='{text}'")
+                    return await food_template_chat_stream(
+                        user_id=user_id,
+                        client_id=user_id,  # Use user_id as client_id
+                        text=text,
+                        mem=mem,
+                        oai=oai,
+                        db=db
+                    )
                 except Exception as e:
-                    print(f"Error generating diet plan: {e}")
+                    print(f"Error calling food template chatbot: {e}")
                     import traceback
                     print(f"Full traceback: {traceback.format_exc()}")
-                    error_msg = "I encountered an issue generating your diet plan. Let me help you with general nutrition advice instead."
+
+                    # Fallback to basic functionality
+                    async def _fallback_diet():
+                        error_msg = "I encountered an issue with the advanced meal planner. Let me help you with general nutrition advice instead."
+                        await mem.add(user_id, "user", text.strip())
+                        await mem.add(user_id, "assistant", error_msg)
+                        yield sse_escape(error_msg)
+                        yield "event: done\ndata: [DONE]\n\n"
+
+                    return StreamingResponse(_fallback_diet(), media_type="text/event-stream",
+                                            headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                # Fallback if import failed
+                async def _import_fallback():
+                    error_msg = "Food template functionality is not available. Let me help you with general nutrition advice instead."
+                    await mem.add(user_id, "user", text.strip())
                     await mem.add(user_id, "assistant", error_msg)
                     yield sse_escape(error_msg)
                     yield "event: done\ndata: [DONE]\n\n"
 
-            return StreamingResponse(_generate_diet_plan(), media_type="text/event-stream",
-                                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+                return StreamingResponse(_import_fallback(), media_type="text/event-stream",
+                                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
         # PRIORITY 3: Check for food logging intent - HANDLE DIRECTLY
         elif intent_type == "FOOD_LOGGING" and confidence > min_confidence:
