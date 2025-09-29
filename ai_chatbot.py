@@ -848,10 +848,11 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
        - BE LIBERAL: Even questions like "workout plan for beginners" should be WORKOUT_PLAN
        - Handle typos: "worutplan", "workoutplan", "excersize plan"
 
-    2. DIET_PLAN: User wants a diet plan, meal plan, or nutrition guidance
-       - Examples: "diet plan", "meal plan", "nutrition plan", "eating plan", "food plan"
-       - Keywords: diet, meal, nutrition, eating, food + plan/template/guide
-       - BE LIBERAL: Even questions like "what should I eat" can be DIET_PLAN if they want guidance
+    2. DIET_PLAN: User wants a complete diet plan, meal plan, or structured eating template
+       - Examples: "diet plan", "meal plan", "nutrition plan", "eating plan", "food plan", "create diet template"
+       - Keywords: diet, meal, eating + plan/template/guide/schedule/program
+       - Must indicate desire for a STRUCTURED PLAN, not just information
+       - NOT for simple nutrition questions like "calories in X" or "nutrition value of Y"
        - Handle typos: "deit plan", "meal templete", "mealplan"
 
     3. FOOD_LOGGING: User mentions eating/consuming food - BE EXTREMELY LIBERAL
@@ -860,18 +861,23 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
        - BE GENEROUS: ANY mention of eating/consuming food is likely logging intent
        - Even simple food names like "apple", "rice" should be FOOD_LOGGING
 
-    4. WORKOUT_LOGGING: User mentions doing exercises or working out
-       - Examples: "I did pushups", "completed workout", "finished training", "did exercises"
-       - Key phrases: "I did", "I completed", "I finished", "just did", "done with"
-       - BE LIBERAL: Any mention of doing exercises = logging intent
+    4. WORKOUT_LOGGING: User wants to LOG/RECORD completed exercises (past tense, successful completion)
+       - Examples: "I did 50 pushups", "completed my workout", "finished training", "did 3 sets of squats"
+       - Key phrases: "I did", "I completed", "I finished", "just did", "done with" + specific exercise details
+       - Must indicate SUCCESSFUL COMPLETION, not problems or questions
+       - NOT for health issues, pain, or advice requests during workouts
 
-    5. NONE: Only for completely unrelated topics or pure information requests
+    5. NONE: For general fitness advice, health questions, information requests, or unrelated topics
+       - Examples: "I got headache during workout", "why do I feel pain", "what causes muscle soreness"
+       - Includes: health issues, workout problems, general fitness advice, nutrition information
 
     CRITICAL RULES:
-    - BE EXTREMELY LIBERAL - when in doubt, choose an action intent over NONE
-    - Simple mentions of food = FOOD_LOGGING
+    - Simple mentions of food consumption = FOOD_LOGGING
     - Any request for plans/routines = corresponding PLAN intent
-    - Past tense actions = logging intents
+    - Past tense SUCCESSFUL workout completion = WORKOUT_LOGGING
+    - Health issues, pain, problems, or advice requests = NONE (general chat)
+    - Nutrition information questions (e.g., "calories in X", "nutrition value of Y") = NONE (general chat)
+    - When in doubt between action intents, choose the most specific one
     - Confidence should be HIGH for obvious matches
     
     Return JSON:
@@ -1240,7 +1246,7 @@ async def chat_stream(
                 if next_food_index != -1:
                     # Ask for next food quantity
                     next_food = foods[next_food_index]
-                    ask_msg = f"Great! Now, how much {next_food['name']} did you have? (e.g., '2 pieces', '1 plate', '100g')"
+                    ask_msg = f"Great! Now, how much {next_food['name']} did you have? (Enter the quantity)"
 
                     await mem.set_pending(user_id, {
                         "state": "awaiting_food_quantity",
