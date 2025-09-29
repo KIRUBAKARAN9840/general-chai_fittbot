@@ -1908,47 +1908,72 @@ How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
                                  headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
     # For all other queries (fitness, nutrition, supplements, etc.), proceed with normal AI chat
-    is_meta = is_fittbot_meta_query(text)
-    is_plan = is_plan_request(text)
+    try:
+        import re  # Ensure re module is available in this scope
+        is_meta = is_fittbot_meta_query(text)
+        is_plan = is_plan_request(text)
 
-    await mem.add(user_id, "user", text.strip())
+        await mem.add(user_id, "user", text.strip())
 
-    if is_plan:
-        msgs, _ = await build_messages(user_id, text.strip(), use_context=True, oai=oai, mem=mem,
-                                       context_only=False, k=TOP_K)
-        msgs.insert(1, {"role": "system", "content": STYLE_PLAN})
-        temperature = 0
-    else:
-        msgs, _ = await build_messages(user_id, text.strip(), use_context=True, oai=oai, mem=mem,
-                                       context_only=is_meta, k=8 if is_meta else TOP_K)
-        msgs.insert(1, {"role": "system", "content": STYLE_CHAT_FORMAT})
-        temperature = 0
+        if is_plan:
+            msgs, _ = await build_messages(user_id, text.strip(), use_context=True, oai=oai, mem=mem,
+                                           context_only=False, k=TOP_K)
+            msgs.insert(1, {"role": "system", "content": STYLE_PLAN})
+            temperature = 0
+        else:
+            msgs, _ = await build_messages(user_id, text.strip(), use_context=True, oai=oai, mem=mem,
+                                           context_only=is_meta, k=8 if is_meta else TOP_K)
+            msgs.insert(1, {"role": "system", "content": STYLE_CHAT_FORMAT})
+            temperature = 0
 
-    resp = oai.chat.completions.create(model=OPENAI_MODEL, messages=msgs, stream=False, temperature=temperature)
-    content = (resp.choices[0].message.content or "").strip()
+        resp = oai.chat.completions.create(model=OPENAI_MODEL, messages=msgs, stream=False, temperature=temperature)
+        content = (resp.choices[0].message.content or "").strip()
 
-    # Fix brand name confusion - Kyra is AI, Fittbot is app
-    content = re.sub(r'\bfit\s*bot\b|\bfit+bot\b', 'Fittbot', content, flags=re.I)
-    content = re.sub(r'\bfitbot\b', 'Fittbot', content, flags=re.I)
-    
-    # Don't replace Kyra with Fittbot when talking about the AI
-    # But do replace wrong usage like "About Kyra" when user asks about Fittbot
-    if 'fittbot' in text.lower() and 'about kyra' in content.lower():
-        content = re.sub(r'\bAbout Kyra\b', 'About Fittbot', content, flags=re.I)
-        content = re.sub(r'\bKyra is a comprehensive fitness app\b', 'Fittbot is a comprehensive fitness app', content, flags=re.I)
-        content = re.sub(r'\bKyra is perfect for\b', 'Fittbot is perfect for', content, flags=re.I)
-    
-    content = re.sub(r'Would you like to log more foods.*?\?.*?🍏?', '', content, flags=re.I | re.DOTALL)
-    content = re.sub(r'Let me know.*?log.*?for you.*?🍏?', '', content, flags=re.I | re.DOTALL)
-    content = re.sub(r'Do you want.*?log.*?\?', '', content, flags=re.I)
+        # Fix brand name confusion - Kyra is AI, Fittbot is app
+        content = re.sub(r'\bfit\s*bot\b|\bfit+bot\b', 'Fittbot', content, flags=re.I)
+        content = re.sub(r'\bfitbot\b', 'Fittbot', content, flags=re.I)
 
-    pretty = pretty_plan(content)
-    async def _one_shot():
-        yield sse_escape(pretty)
-        await mem.add(user_id, "assistant", pretty)
-        yield "event: done\ndata: [DONE]\n\n"
-    return StreamingResponse(_one_shot(), media_type="text/event-stream",
-                             headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        # Don't replace Kyra with Fittbot when talking about the AI
+        # But do replace wrong usage like "About Kyra" when user asks about Fittbot
+        if 'fittbot' in text.lower() and 'about kyra' in content.lower():
+            content = re.sub(r'\bAbout Kyra\b', 'About Fittbot', content, flags=re.I)
+            content = re.sub(r'\bKyra is a comprehensive fitness app\b', 'Fittbot is a comprehensive fitness app', content, flags=re.I)
+            content = re.sub(r'\bKyra is perfect for\b', 'Fittbot is perfect for', content, flags=re.I)
+
+        content = re.sub(r'Would you like to log more foods.*?\?.*?🍏?', '', content, flags=re.I | re.DOTALL)
+        content = re.sub(r'Let me know.*?log.*?for you.*?🍏?', '', content, flags=re.I | re.DOTALL)
+        content = re.sub(r'Do you want.*?log.*?\?', '', content, flags=re.I)
+
+        pretty = pretty_plan(content)
+        async def _one_shot():
+            try:
+                yield sse_escape(pretty)
+                await mem.add(user_id, "assistant", pretty)
+                yield "event: done\ndata: [DONE]\n\n"
+            except Exception as stream_error:
+                print(f"Error in general chat stream: {stream_error}")
+                yield sse_escape("I'm having trouble completing this response. Please try again!")
+                yield "event: done\ndata: [DONE]\n\n"
+        return StreamingResponse(_one_shot(), media_type="text/event-stream",
+                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    except Exception as e:
+        print(f"Error in general chat processing: {e}")
+        import traceback
+        print(f"General chat error traceback: {traceback.format_exc()}")
+
+        # Provide fallback response and clear any pending state
+        async def _general_chat_error():
+            error_msg = "I'm having trouble processing your request right now. Please try again, and I'll do my best to help you with your fitness journey!"
+            try:
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", error_msg)
+            except:
+                pass  # Don't let memory errors cascade
+            yield sse_escape(error_msg)
+            yield "event: done\ndata: [DONE]\n\n"
+
+        return StreamingResponse(_general_chat_error(), media_type="text/event-stream",
+                                 headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 # Keep all existing endpoints
 @router.post("/kb/upsert")
