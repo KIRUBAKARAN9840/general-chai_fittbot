@@ -1,5 +1,4 @@
 # routes/ai_chatbot.py - Complete Fixed Version with Improved AI Intent Detection
-
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, Depends
 from fastapi.responses import StreamingResponse
 from fastapi_limiter.depends import RateLimiter
@@ -18,6 +17,9 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.llm_helpers i
     sse_json, sse_escape, gpt_small_route, is_yes, is_no, is_fitness_related,
     has_action_verb, is_fittbot_meta_query, is_plan_request, STYLE_PLAN, STYLE_CHAT_FORMAT, pretty_plan
 )
+
+# Import specialized chatbot functionalities
+from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate, ClientDietTemplate, MealTemplate, ActualDiet, ClientTarget
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.report_analysis import (
     is_analysis_intent, is_followup_question, set_mode, get_mode,
     set_analysis_artifacts, get_analysis_artifacts, build_analysis_dataset_dict,
@@ -47,14 +49,26 @@ def has_action_indicators(text: str) -> bool:
         # Creation words
         'create', 'make', 'build', 'design', 'plan', 'generate', 'develop',
         'give', 'tell', 'show', 'provide', 'suggest', 'recommend',
-        # Logging words  
+        'need', 'want', 'help', 'assist',
+        # Logging words
         'log', 'track', 'record', 'save', 'add', 'input', 'enter',
         # Past tense logging
-        'ate', 'had', 'consumed', 'did', 'completed', 'finished', 'done'
+        'ate', 'had', 'consumed', 'did', 'completed', 'finished', 'done',
+        # Plan-related words
+        'workout', 'exercise', 'diet', 'meal', 'nutrition', 'template', 'routine'
     ]
-    
+
     text_lower = text.lower()
-    return any(word in text_lower for word in action_words)
+
+    # Also check for fitness-related phrases that imply action
+    fitness_action_phrases = [
+        'workout plan', 'exercise plan', 'diet plan', 'meal plan',
+        'fitness routine', 'training program', 'nutrition plan',
+        'weight loss plan', 'muscle gain plan'
+    ]
+
+    return (any(word in text_lower for word in action_words) or
+            any(phrase in text_lower for phrase in fitness_action_phrases))
 
 def is_simple_food_mention(text: str) -> bool:
     """Detect simple food mentions - now just marks candidates for AI check"""
@@ -173,44 +187,643 @@ def correct_food_spelling_with_ai(text: str, oai) -> str:
         print(f"DEBUG: Spell correction error: {e}")
         return text  # Return original if correction fails
 
+# =============================================================================
+# SPECIALIZED CHATBOT FUNCTIONALITIES INTEGRATED
+# =============================================================================
+
+# Food Logging Functions
+def extract_food_info_using_ai(text: str, oai):
+    """AI-driven food extraction with comprehensive prompt"""
+
+    prompt = f"""
+    Analyze this text and extract food information: "{text}"
+
+    CRITICAL FOOD IDENTIFICATION RULES:
+    1. COMPOUND FOODS: Treat compound words as SINGLE dishes:
+       - "curdrice" = "curd rice" (one dish, not separate curd and rice)
+       - "lemonrice" = "lemon rice" (one dish)
+       - "masalatea" = "masala tea" (one dish)
+
+    2. FOOD DETECTION: Extract ALL foods/drinks, handle misspellings liberally
+    3. CONTEXT AWARENESS: Consider Indian cuisine context for units and dishes
+
+    INTELLIGENT UNIT ASSIGNMENT:
+    When quantity is provided, choose the MOST LOGICAL unit based on:
+
+    INDIAN RICE DISHES (use plates/bowls):
+    - Any rice dish: biryani, pulao, fried rice, lemon rice, curd rice → plates
+    - Curries, dal, sambar → bowls
+
+    MEASUREMENT CONTEXT:
+    - "spoon", "spoons" → tablespoons (NOT grams)
+    - Small countable items → pieces
+    - Liquids → ml, cups, glasses
+    - Large servings → plates, bowls
+    - Precise measurements → grams, kg
+
+    QUANTITY INTERPRETATION:
+    - If user provides quantity, extract it exactly
+    - If no quantity, set to null
+    - Choose unit that matches natural serving size
+
+    Return ONLY valid JSON array:
+    [
+        {{
+            "name": "properly_formatted_food_name",
+            "quantity": number_or_null,
+            "unit": "contextually_appropriate_unit",
+            "calories": number_or_null,
+            "protein": number_or_null,
+            "carbs": number_or_null,
+            "fat": number_or_null,
+            "fiber": number_or_null,
+            "sugar": number_or_null
+        }}
+    ]
+    """
+
+    try:
+        response = oai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a nutrition expert. Extract food information accurately and return only valid JSON."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.1
+        )
+
+        result = response.choices[0].message.content.strip()
+        import re
+        result = re.sub(r"^```json\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
+
+        foods = json.loads(result)
+        if not isinstance(foods, list):
+            foods = [foods] if isinstance(foods, dict) else []
+
+        return {"foods": foods}
+
+    except Exception as e:
+        print(f"Food extraction error: {e}")
+        return {"foods": []}
+
+def calculate_nutrition_using_ai(food_name, quantity, unit, oai):
+    """Enhanced nutrition calculation with better unit handling"""
+    try:
+        prompt = f"""
+        Calculate nutrition for: {quantity} {unit} of {food_name}
+
+        Use these REALISTIC conversions:
+        - 1 plate (rice dishes) = 300 grams
+        - 1 tablespoon = 15 grams (solids) or 15 ml (liquids)
+        - 1 teaspoon = 5 grams (solids) or 5 ml (liquids)
+        - 1 cup = 200 grams (solids) or 200 ml (liquids)
+        - 1 bowl = 200 grams
+        - 1 glass = 200 ml
+        - 1 piece varies by food type (estimate appropriately)
+
+        Return ONLY valid JSON with realistic values:
+        {{
+            "calories": number,
+            "protein": number,
+            "carbs": number,
+            "fat": number,
+            "fiber": number,
+            "sugar": number
+        }}
+        """
+
+        response = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a nutrition expert. Always provide realistic nutrition values."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            temperature=0
+        )
+
+        result = response.choices[0].message.content.strip()
+        result = re.sub(r"^```json\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
+
+        nutrition = json.loads(result)
+        return nutrition
+
+    except Exception as e:
+        print(f"AI nutrition calculation failed: {e}")
+        return {"calories": 100, "protein": 3, "carbs": 15, "fat": 2, "fiber": 1, "sugar": 2}
+
+def store_diet_data_to_db(db: Session, client_id: int, date: str, logged_foods: list, meal: str):
+    """Store logged food data in actual_diet table"""
+    try:
+        existing_entry = db.query(ActualDiet).filter(
+            ActualDiet.client_id == client_id,
+            ActualDiet.date == date
+        ).first()
+
+        food_items = []
+        for food in logged_foods:
+            food_item = {
+                "id": str(int(datetime.now().timestamp() * 1000)),
+                "name": food.get('name', ''),
+                "quantity": f"{food.get('quantity', 0)} {food.get('unit', 'serving')}",
+                "calories": food.get('calories', 0),
+                "protein": food.get('protein', 0),
+                "carbs": food.get('carbs', 0),
+                "fat": food.get('fat', 0),
+                "fiber": food.get('fiber', 0),
+                "sugar": food.get('sugar', 0),
+                "image_url": ""
+            }
+            food_items.append(food_item)
+
+        if existing_entry:
+            diet_data = existing_entry.diet_data if existing_entry.diet_data else []
+            meal_found = False
+            for meal_category in diet_data:
+                if meal_category.get("title", "").lower() == meal.lower():
+                    meal_category["foodList"].extend(food_items)
+                    meal_category["itemsCount"] = len(meal_category["foodList"])
+                    meal_found = True
+                    break
+
+            if not meal_found:
+                default_structure = get_default_diet_structure()
+                for default_meal in default_structure:
+                    if default_meal.get("title", "").lower() == meal.lower():
+                        default_meal["foodList"] = food_items
+                        default_meal["itemsCount"] = len(food_items)
+                        diet_data.append(default_meal)
+                        break
+
+            from sqlalchemy.orm import attributes
+            attributes.flag_modified(existing_entry, "diet_data")
+            existing_entry.diet_data = diet_data
+            db.commit()
+
+        else:
+            diet_data = get_default_diet_structure()
+            for meal_category in diet_data:
+                if meal_category.get("title", "").lower() == meal.lower():
+                    meal_category["foodList"] = food_items
+                    meal_category["itemsCount"] = len(food_items)
+                    break
+
+            new_entry = ActualDiet(
+                client_id=client_id,
+                date=date,
+                diet_data=diet_data
+            )
+            db.add(new_entry)
+            db.commit()
+
+        return True
+
+    except Exception as e:
+        print(f"Error storing diet data: {e}")
+        db.rollback()
+        return False
+
+def get_default_diet_structure():
+    """Return the default diet structure"""
+    return [
+        {"id": "1", "title": "Pre workout", "tagline": "Energy boost", "foodList": [], "timeRange": "6:30-7:00 AM", "itemsCount": 0},
+        {"id": "2", "title": "Post workout", "tagline": "Recovery fuel", "foodList": [], "timeRange": "7:30-8:00 AM", "itemsCount": 0},
+        {"id": "3", "title": "Early morning Detox", "tagline": "Early morning nutrition", "foodList": [], "timeRange": "5:30-6:00 AM", "itemsCount": 0},
+        {"id": "4", "title": "Pre-Breakfast / Pre-Meal Starter", "tagline": "Pre-breakfast fuel", "foodList": [], "timeRange": "7:00-7:30 AM", "itemsCount": 0},
+        {"id": "5", "title": "Breakfast", "tagline": "Start your day right", "foodList": [], "timeRange": "8:30-9:30 AM", "itemsCount": 0},
+        {"id": "6", "title": "Mid-Morning snack", "tagline": "Healthy meal", "foodList": [], "timeRange": "10:00-11:00 AM", "itemsCount": 0},
+        {"id": "7", "title": "Lunch", "tagline": "Nutritious midday meal", "foodList": [], "timeRange": "1:00-2:00 PM", "itemsCount": 0},
+        {"id": "8", "title": "Evening snack", "tagline": "Healthy meal", "foodList": [], "timeRange": "4:00-5:00 PM", "itemsCount": 0},
+        {"id": "9", "title": "Dinner", "tagline": "End your day well", "foodList": [], "timeRange": "7:30-8:30 PM", "itemsCount": 0},
+        {"id": "10", "title": "Bed time", "tagline": "Rest well", "foodList": [], "timeRange": "9:30-10:00 PM", "itemsCount": 0}
+    ]
+
+# Workout Template Functions
+def fetch_client_profile(db: Session, client_id: int):
+    """Fetch complete client profile for workout generation"""
+    try:
+        w = db.query(WeightJourney).where(WeightJourney.client_id == client_id).order_by(WeightJourney.id.desc()).first()
+        current_weight = float(w.actual_weight) if w and w.actual_weight is not None else 70.0
+        target_weight = float(w.target_weight) if w and w.target_weight is not None else 65.0
+
+        c = db.query(Client).where(Client.client_id == client_id).first()
+        client_goal = (getattr(c, "goals", None) or getattr(c, "goal", None) or "muscle gain") if c else "muscle gain"
+        lifestyle = c.lifestyle if c else "moderate"
+
+        ct = db.query(ClientTarget).where(ClientTarget.client_id == client_id).first()
+        target_calories = float(ct.calories) if ct and ct.calories else 2000.0
+
+        return {
+            "client_id": client_id,
+            "current_weight": current_weight,
+            "target_weight": target_weight,
+            "client_goal": client_goal,
+            "target_calories": target_calories,
+            "lifestyle": lifestyle,
+        }
+    except Exception as e:
+        print(f"Error fetching profile: {e}")
+        return {
+            "client_id": client_id,
+            "current_weight": 70.0,
+            "target_weight": 65.0,
+            "client_goal": "muscle gain",
+            "target_calories": 2000.0,
+            "lifestyle": "moderate",
+        }
+
+def generate_workout_template_with_ai(user_request: str, profile: dict, oai):
+    """Generate workout template using AI"""
+    try:
+        print(f"DEBUG: Starting workout generation for request: '{user_request}'")
+        prompt = f"""
+        Create a workout template based on this request: "{user_request}"
+
+        User Profile:
+        - Current Weight: {profile['current_weight']}kg
+        - Target Weight: {profile['target_weight']}kg
+        - Goal: {profile['client_goal']}
+        - Lifestyle: {profile['lifestyle']}
+
+        Generate a 6-day workout plan (Monday-Saturday) with proper exercise selection.
+
+        Return ONLY valid JSON:
+        {{
+            "template_name": "descriptive_name",
+            "days": {{
+                "monday": {{
+                    "title": "Day 1 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}},
+                        {{"name": "Exercise Name", "sets": 3, "reps": 10}}
+                    ]
+                }},
+                "tuesday": {{
+                    "title": "Day 2 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}}
+                    ]
+                }},
+                "wednesday": {{
+                    "title": "Day 3 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}}
+                    ]
+                }},
+                "thursday": {{
+                    "title": "Day 4 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}}
+                    ]
+                }},
+                "friday": {{
+                    "title": "Day 5 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}}
+                    ]
+                }},
+                "saturday": {{
+                    "title": "Day 6 - Focus Area",
+                    "exercises": [
+                        {{"name": "Exercise Name", "sets": 3, "reps": 12}}
+                    ]
+                }}
+            }}
+        }}
+        """
+
+        print(f"DEBUG: Sending workout request to OpenAI...")
+        response = oai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a fitness expert. Generate comprehensive workout templates in valid JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.3
+        )
+
+        result = response.choices[0].message.content.strip()
+        print(f"DEBUG: OpenAI workout response length: {len(result)}")
+        result = re.sub(r"^```json\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
+
+        workout_data = json.loads(result)
+        print(f"DEBUG: Successfully parsed workout JSON with keys: {list(workout_data.keys())}")
+        return workout_data
+
+    except Exception as e:
+        print(f"Workout generation error: {e}")
+        return None
+
+def generate_diet_template_with_ai(user_request: str, profile: dict, oai):
+    """Generate diet template using AI"""
+    try:
+        print(f"DEBUG: Starting diet generation for request: '{user_request}'")
+        prompt = f"""
+        Create a diet template based on this request: "{user_request}"
+
+        User Profile:
+        - Current Weight: {profile['current_weight']}kg
+        - Target Weight: {profile['target_weight']}kg
+        - Goal: {profile['client_goal']}
+        - Target Calories: {profile['target_calories']}
+        - Lifestyle: {profile['lifestyle']}
+
+        Generate a comprehensive daily meal plan with 10 meal slots as shown in the structure.
+
+        Return ONLY valid JSON with this exact structure - include all 10 meal slots:
+        {{
+            "template_name": "descriptive_name",
+            "meals": [
+                {{
+                    "id": "1",
+                    "title": "Pre workout",
+                    "tagline": "Energy boost",
+                    "foodList": [
+                        {{"name": "Food Name", "quantity": "amount unit", "calories": 100, "protein": 5, "carbs": 15, "fat": 3}}
+                    ],
+                    "timeRange": "6:30-7:00 AM",
+                    "itemsCount": 1
+                }},
+                {{
+                    "id": "2",
+                    "title": "Post workout",
+                    "tagline": "Recovery fuel",
+                    "foodList": [
+                        {{"name": "Food Name", "quantity": "amount unit", "calories": 100, "protein": 5, "carbs": 15, "fat": 3}}
+                    ],
+                    "timeRange": "7:30-8:00 AM",
+                    "itemsCount": 1
+                }},
+                {{
+                    "id": "3",
+                    "title": "Breakfast",
+                    "tagline": "Start your day right",
+                    "foodList": [
+                        {{"name": "Food Name", "quantity": "amount unit", "calories": 100, "protein": 5, "carbs": 15, "fat": 3}}
+                    ],
+                    "timeRange": "8:30-9:30 AM",
+                    "itemsCount": 1
+                }}
+            ]
+        }}
+        """
+
+        print(f"DEBUG: Sending diet request to OpenAI...")
+        response = oai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": "You are a nutrition expert. Generate comprehensive diet templates in valid JSON format."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=2000,
+            temperature=0.3
+        )
+
+        result = response.choices[0].message.content.strip()
+        print(f"DEBUG: OpenAI diet response length: {len(result)}")
+        result = re.sub(r"^```json\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
+
+        diet_data = json.loads(result)
+        print(f"DEBUG: Successfully parsed diet JSON with keys: {list(diet_data.keys())}")
+        return diet_data
+
+    except Exception as e:
+        print(f"Diet generation error: {e}")
+        return None
+
+def format_workout_template_display(template: dict) -> str:
+    """Format workout template for display"""
+    if not template or not template.get('days'):
+        return "❌ No workout data available"
+
+    formatted_lines = []
+    formatted_lines.append(f"💪 {template.get('template_name', 'Your Workout Template').upper()} 💪")
+    formatted_lines.append("═" * 50)
+    formatted_lines.append("")
+
+    day_count = 1
+    day_emojis = {1: "🔥", 2: "💥", 3: "⚡", 4: "🚀", 5: "💪", 6: "🎯", 7: "🌟"}
+
+    for day_key, day_data in template['days'].items():
+        if not isinstance(day_data, dict):
+            continue
+
+        day_emoji = day_emojis.get(day_count, "💫")
+        title = day_data.get('title', f'Day {day_count}')
+
+        formatted_lines.append(f"{day_emoji} {title.upper()} {day_emoji}")
+        formatted_lines.append("─" * 30)
+        formatted_lines.append("")
+
+        exercises = day_data.get('exercises', [])
+        if exercises:
+            for i, exercise in enumerate(exercises, 1):
+                name = exercise.get('name', 'Unknown Exercise')
+                sets = exercise.get('sets', 0)
+                reps = exercise.get('reps', 0)
+                formatted_lines.append(f"   🏋️ {i}. {name}")
+                formatted_lines.append(f"      📊 {sets} sets × {reps} reps")
+                formatted_lines.append("")
+        else:
+            formatted_lines.append("   ⚠️ No exercises added yet")
+            formatted_lines.append("")
+
+        formatted_lines.append("")
+        day_count += 1
+
+    return "\n".join(formatted_lines)
+
+def extract_workout_info_using_ai(text: str, oai):
+    """Extract workout information using AI"""
+    try:
+        prompt = f"""
+        Analyze this text and extract workout/exercise information: "{text}"
+
+        Extract any exercises mentioned along with sets, reps, and duration if provided.
+
+        Return ONLY valid JSON array:
+        [
+            {{
+                "name": "exercise_name",
+                "sets": number_or_null,
+                "reps": number_or_null,
+                "duration": "time_string_or_null",
+                "weight": "weight_string_or_null"
+            }}
+        ]
+
+        Examples:
+        - "I did 3 sets of 10 pushups" → [{{"name": "pushups", "sets": 3, "reps": 10, "duration": null, "weight": null}}]
+        - "ran for 30 minutes" → [{{"name": "running", "sets": null, "reps": null, "duration": "30 minutes", "weight": null}}]
+        - "bench press with 60kg, 3 sets of 8" → [{{"name": "bench press", "sets": 3, "reps": 8, "duration": null, "weight": "60kg"}}]
+        """
+
+        response = oai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a fitness expert. Extract workout information accurately and return only valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=500,
+            temperature=0.1
+        )
+
+        result = response.choices[0].message.content.strip()
+        result = re.sub(r"^```json\s*", "", result)
+        result = re.sub(r"\s*```$", "", result)
+
+        exercises = json.loads(result)
+        if not isinstance(exercises, list):
+            exercises = [exercises] if isinstance(exercises, dict) else []
+
+        return {"exercises": exercises}
+
+    except Exception as e:
+        print(f"Workout extraction error: {e}")
+        return {"exercises": []}
+
+def parse_quantity_input(text: str):
+    """Parse quantity input from user"""
+    text_lower = text.lower().strip()
+
+    # Pattern matching for quantity with optional unit
+    patterns = [
+        r'(\d+(?:\.\d+)?)\s*(spoons?|tablespoons?|tbsp|teaspoons?|tsp|plates?|bowls?|pieces?|pcs?|pc|g|grams?|kg|ml|cups?|glasses?)',
+        r'(\d+(?:\.\d+)?)',  # Just numbers
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if match:
+            quantity = float(match.group(1))
+            unit = match.group(2) if len(match.groups()) > 1 else None
+
+            # Normalize unit
+            unit_map = {
+                'spoon': 'tablespoons', 'spoons': 'tablespoons',
+                'tablespoon': 'tablespoons', 'tbsp': 'tablespoons',
+                'teaspoon': 'teaspoons', 'tsp': 'teaspoons',
+                'plate': 'plates', 'bowl': 'bowls',
+                'piece': 'pieces', 'pcs': 'pieces', 'pc': 'pieces',
+                'g': 'grams', 'gram': 'grams',
+                'kg': 'kg', 'kilogram': 'kg',
+                'cup': 'cups', 'glass': 'glasses',
+                'ml': 'ml'
+            }
+
+            if unit:
+                unit = unit_map.get(unit, unit)
+
+            return quantity, unit
+
+    return None, None
+
+def format_diet_template_display(template: dict) -> str:
+    """Format diet template for display"""
+    if not template or not template.get('meals'):
+        return "❌ No diet data available"
+
+    formatted_lines = []
+    formatted_lines.append(f"🍽️ {template.get('template_name', 'Your Diet Template').upper()} 🍽️")
+    formatted_lines.append("═" * 50)
+    formatted_lines.append("")
+
+    total_calories = 0
+    total_protein = 0
+    total_carbs = 0
+    total_fat = 0
+
+    for meal in template['meals']:
+        title = meal.get('title', 'Unknown Meal')
+        time_range = meal.get('timeRange', '')
+        tagline = meal.get('tagline', '')
+
+        formatted_lines.append(f"🕐 {title.upper()} - {time_range}")
+        if tagline:
+            formatted_lines.append(f"   {tagline}")
+        formatted_lines.append("─" * 30)
+        formatted_lines.append("")
+
+        food_list = meal.get('foodList', [])
+        if food_list:
+            for food in food_list:
+                name = food.get('name', 'Unknown Food')
+                quantity = food.get('quantity', '')
+                calories = food.get('calories', 0)
+                protein = food.get('protein', 0)
+                carbs = food.get('carbs', 0)
+                fat = food.get('fat', 0)
+
+                formatted_lines.append(f"   🥗 {name} - {quantity}")
+                formatted_lines.append(f"      📊 {calories}cal | P:{protein}g | C:{carbs}g | F:{fat}g")
+                formatted_lines.append("")
+
+                total_calories += calories
+                total_protein += protein
+                total_carbs += carbs
+                total_fat += fat
+        else:
+            formatted_lines.append("   ⚠️ No foods added yet")
+            formatted_lines.append("")
+
+        formatted_lines.append("")
+
+    formatted_lines.append("═" * 50)
+    formatted_lines.append(f"📊 DAILY TOTALS: {total_calories}cal | Protein: {total_protein}g | Carbs: {total_carbs}g | Fat: {total_fat}g")
+
+    return "\n".join(formatted_lines)
+
 def detect_user_intent_with_ai(text: str, oai) -> dict:
     """Use AI to detect user intent with improved accuracy and specificity"""
     
     prompt = f"""
     Analyze this user message and determine their SPECIFIC intent: "{text}"
     
-    ONLY detect these intents if the user is clearly requesting ACTION:
-    
-    1. WORKOUT_PLAN: User wants to CREATE/MAKE/GET a workout plan, exercise template, training routine
-       - Examples: "create workout plan", "make exercise routine", "plan my workouts", "tell workout plan", "give workout plan", "show me workout plan"
+    BE VERY LIBERAL with intent detection. Detect these intents:
+
+    1. WORKOUT_PLAN: User wants a workout plan, exercise routine, or training program
+       - Examples: "workout plan", "exercise routine", "training program", "fitness plan", "workout for weight loss"
+       - Keywords: workout, exercise, training, fitness + plan/routine/program/template
+       - BE LIBERAL: Even questions like "workout plan for beginners" should be WORKOUT_PLAN
        - Handle typos: "worutplan", "workoutplan", "excersize plan"
-       - NOT: "workout benefits", "exercise tips", "how to do pushups"
-    
-    2. DIET_PLAN: User wants to CREATE/MAKE/GET a diet plan, meal plan, nutrition template
-       - Examples: "create diet plan", "make meal plan", "plan my meals", "tell me diet plan", "give diet plan"
+
+    2. DIET_PLAN: User wants a diet plan, meal plan, or nutrition guidance
+       - Examples: "diet plan", "meal plan", "nutrition plan", "eating plan", "food plan"
+       - Keywords: diet, meal, nutrition, eating, food + plan/template/guide
+       - BE LIBERAL: Even questions like "what should I eat" can be DIET_PLAN if they want guidance
        - Handle typos: "deit plan", "meal templete", "mealplan"
-       - NOT: "nutrition facts", "food benefits", "calories in apple", "what to eat"
-    
-    3. FOOD_LOGGING: User wants to LOG/TRACK/RECORD food they ate/consumed - BE VERY LIBERAL HERE
-       - Examples: "log apple", "I ate rice", "track my breakfast", "add food to diary", "I had chicken", "ate pizza", "consumed banana"
+
+    3. FOOD_LOGGING: User mentions eating/consuming food - BE EXTREMELY LIBERAL
+       - Examples: "I ate rice", "had breakfast", "consumed apple", "ate pizza", just mentions food names
        - Key phrases: "I ate", "I had", "I consumed", "I finished", "just ate", "just had"
-       - BE GENEROUS: If someone mentions eating/having/consuming food, it's likely logging intent
-       - NOT: "apple nutrition", "benefits of rice", "how many calories" (these are info requests)
-    
-    4. WORKOUT_LOGGING: User wants to LOG/SAVE/RECORD exercises they did
-       - Examples: "log my workout", "I did pushups", "save exercise", "record training", "I completed", "just finished workout"
+       - BE GENEROUS: ANY mention of eating/consuming food is likely logging intent
+       - Even simple food names like "apple", "rice" should be FOOD_LOGGING
+
+    4. WORKOUT_LOGGING: User mentions doing exercises or working out
+       - Examples: "I did pushups", "completed workout", "finished training", "did exercises"
        - Key phrases: "I did", "I completed", "I finished", "just did", "done with"
-       - NOT: "how to do exercise", "workout tips", "exercise benefits"
-    
-    5. NONE: General questions, information requests, nutrition facts, exercise tips, etc.
-    
-    IMPORTANT RULES:
-    - Information/question requests → NONE
-    - Nutrition facts/benefits → NONE  
-    - Exercise instructions/tips → NONE
-    - BE VERY LIBERAL with logging detection - if someone says they ate/did something, assume they want to log it
-    - Past tense eating/exercise = likely logging intent
-    - Words like "tell", "give", "show", "provide" + "plan" = plan creation intent
+       - BE LIBERAL: Any mention of doing exercises = logging intent
+
+    5. NONE: Only for completely unrelated topics or pure information requests
+
+    CRITICAL RULES:
+    - BE EXTREMELY LIBERAL - when in doubt, choose an action intent over NONE
+    - Simple mentions of food = FOOD_LOGGING
+    - Any request for plans/routines = corresponding PLAN intent
+    - Past tense actions = logging intents
+    - Confidence should be HIGH for obvious matches
     
     Return JSON:
     {{
@@ -227,7 +840,7 @@ def detect_user_intent_with_ai(text: str, oai) -> dict:
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a precise intent classifier. Only detect action intents (create/log/plan/track). Information requests should be NONE. Be conservative - when unsure, choose NONE."
+                    "content": "You are an intent classifier. BE LIBERAL - when in doubt, choose an action intent. Fitness-related requests usually want plans or logging. Be generous with confidence scores."
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -278,7 +891,7 @@ def pretty_plan(markdown: str) -> str:
     txt = "\n".join(line.rstrip() for line in txt.split("\n"))
     return txt.strip()
 
-@router.get("/chat/stream_test", dependencies=[Depends(RateLimiter(times=30, seconds=60))])
+@router.get("/chat/stream_test")
 async def chat_stream(
     user_id: int,
     text: str = Query(...),
@@ -443,6 +1056,126 @@ async def chat_stream(
             print(f"DEBUG: Clearing food redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
 
+    # Handle food quantity input (NEW INTEGRATED FUNCTIONALITY)
+    if pend.get("state") == "awaiting_food_quantity":
+        print("DEBUG: In awaiting_food_quantity state")
+        try:
+            foods = pend.get("foods", [])
+            current_index = pend.get("current_food_index", 0)
+            current_food = foods[current_index] if current_index < len(foods) else None
+            logged_foods = pend.get("logged_foods", [])
+
+            if not current_food:
+                print("DEBUG: No current food found, clearing state")
+                await mem.set_pending(user_id, None)
+                async def _error_no_food():
+                    yield sse_escape("Something went wrong. Please tell me what you ate again.")
+                    yield "event: done\ndata: [DONE]\n\n"
+                return StreamingResponse(_error_no_food(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+            # Parse quantity from input
+            quantity, unit = parse_quantity_input(text)
+
+            if quantity is not None:
+                print(f"DEBUG: Parsed quantity: {quantity} {unit} for {current_food['name']}")
+
+                # Use default unit if none provided
+                if not unit:
+                    unit = current_food.get('unit', 'pieces')
+
+                # Update food with quantity and calculate nutrition
+                foods[current_index]["quantity"] = quantity
+                foods[current_index]["unit"] = unit
+
+                nutrition = calculate_nutrition_using_ai(
+                    current_food['name'], quantity, unit, oai
+                )
+                foods[current_index].update(nutrition)
+
+                # Move to logged foods
+                logged_foods.append(foods[current_index])
+
+                # Check for next food needing quantity
+                next_food_index = -1
+                for i in range(current_index + 1, len(foods)):
+                    if foods[i].get("quantity") is None:
+                        next_food_index = i
+                        break
+
+                if next_food_index != -1:
+                    # Ask for next food quantity
+                    next_food = foods[next_food_index]
+                    ask_msg = f"Great! Now, how much {next_food['name']} did you have? (e.g., '2 pieces', '1 plate', '100g')"
+
+                    await mem.set_pending(user_id, {
+                        "state": "awaiting_food_quantity",
+                        "foods": foods,
+                        "current_food_index": next_food_index,
+                        "logged_foods": logged_foods
+                    })
+
+                    async def _ask_next_quantity():
+                        yield sse_escape(ask_msg)
+                        yield "event: done\ndata: [DONE]\n\n"
+
+                    return StreamingResponse(_ask_next_quantity(), media_type="text/event-stream",
+                                           headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+                else:
+                    # All foods processed, log everything
+                    await mem.set_pending(user_id, None)
+
+                    # Store to database
+                    today_date = datetime.now(IST).strftime("%Y-%m-%d")
+                    store_diet_data_to_db(db, user_id, today_date, logged_foods, "breakfast")
+
+                    # Create summary
+                    food_summaries = []
+                    total_calories = 0
+                    for food in logged_foods:
+                        food_summaries.append(f"{food['quantity']} {food['unit']} of {food['name']}")
+                        total_calories += food.get('calories', 0)
+
+                    if len(food_summaries) == 1:
+                        message = f"✅ Logged {food_summaries[0]}!"
+                    else:
+                        message = f"✅ Logged {', '.join(food_summaries[:-1])} and {food_summaries[-1]}!"
+
+                    message += f"\n📊 Total: {total_calories} calories added to your food diary"
+
+                    await mem.add(user_id, "user", text.strip())
+                    await mem.add(user_id, "assistant", message)
+
+                    async def _final_food_log():
+                        yield sse_json({
+                            "type": "food_logged",
+                            "logged_foods": logged_foods,
+                            "message": message
+                        })
+                        yield "event: done\ndata: [DONE]\n\n"
+
+                    return StreamingResponse(_final_food_log(), media_type="text/event-stream",
+                                           headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                # Ask again for valid quantity
+                ask_msg = f"Please enter a valid quantity for {current_food['name']}. For example: '2', '1.5 plates', or '100g'"
+
+                async def _ask_quantity_again():
+                    yield sse_escape(ask_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_ask_quantity_again(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+        except Exception as e:
+            print(f"Error processing food quantity: {e}")
+            await mem.set_pending(user_id, None)
+            async def _quantity_error():
+                yield sse_escape("Something went wrong. Please tell me what you ate again.")
+                yield "event: done\ndata: [DONE]\n\n"
+            return StreamingResponse(_quantity_error(), media_type="text/event-stream",
+                                   headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
     # Handle workout logging confirmation
     if pend.get("state") == "awaiting_workout_log_redirect_confirm":
         if is_yes(text):
@@ -474,14 +1207,12 @@ async def chat_stream(
             print(f"DEBUG: Clearing workout log redirect state due to topic change to: {text}")
             await mem.set_pending(user_id, None)
 
-    # IMPROVED AI-powered intent detection - only run if no pending states
     # First check if there are clear action indicators OR if it's a fitness-related question
     has_action = has_action_indicators(text)
     is_fitness_question = is_fitness_related(text)
     
     print(f"DEBUG Intent Check: has_action={has_action}, is_fitness={is_fitness_question}, text='{text}'")
     
-    # PRIORITY CHECK: Simple food mentions should be checked FIRST before other intent detection
     # This prevents single food words from being processed as fitness questions
     if not has_action and is_simple_food_mention(text):
         # Use AI to verify it's actually a food
@@ -510,97 +1241,294 @@ async def chat_stream(
         else:
             print(f"DEBUG: AI determined '{text}' is not a food item")
     
+    # Run AI intent detection more aggressively - check for any fitness-related content
+    should_check_intent = (
+        has_action or
+        is_fitness_question or
+        any(word in text.lower() for word in ['workout', 'exercise', 'diet', 'meal', 'plan', 'routine', 'training', 'fitness', 'nutrition']) or
+        len(text.split()) <= 5  # Also check short phrases that might be plans
+    )
+
+    print(f"DEBUG: should_check_intent={should_check_intent}")
+
     # Run AI intent detection for action requests OR fitness questions (to catch edge cases)
-    if has_action or is_fitness_question:
+    if should_check_intent:
         intent_result = detect_user_intent_with_ai(text, oai)
         intent_type = intent_result.get("intent", "NONE")
         confidence = intent_result.get("confidence", 0.0)
         action_detected = intent_result.get("action_detected", False)
         reasoning = intent_result.get("reasoning", "")
         
+        # More liberal for plan creation and logging
+        if intent_type in ["WORKOUT_PLAN", "DIET_PLAN"]:
+            min_confidence = 0.3  # Much lower threshold for plan creation
+        elif intent_type in ["FOOD_LOGGING", "WORKOUT_LOGGING"]:
+            min_confidence = 0.3  # Even lower threshold for logging (since these are important)
+        else:
+            min_confidence = 0.5  # Lower threshold for other intents
+
         print(f"DEBUG AI Intent: {intent_type} (confidence: {confidence}, action: {action_detected})")
         print(f"DEBUG AI Reasoning: {reasoning}")
         print(f"DEBUG has_action: {has_action}, is_fitness: {is_fitness_question}")
+        print(f"DEBUG min_confidence for {intent_type}: {min_confidence}")
+        print(f"DEBUG Will trigger: {intent_type in ['WORKOUT_PLAN', 'DIET_PLAN', 'FOOD_LOGGING', 'WORKOUT_LOGGING'] and confidence > min_confidence}")
+
         
-        # Use different confidence thresholds for different intent types
-        # More liberal for plan creation and logging
-        if intent_type in ["WORKOUT_PLAN", "DIET_PLAN"]:
-            min_confidence = 0.7  # Lower threshold for plan creation
-        elif intent_type in ["FOOD_LOGGING", "WORKOUT_LOGGING"]:
-            min_confidence = 0.6  # Even lower threshold for logging (since these are important)
-        else:
-            min_confidence = 0.8  # Higher threshold for other intents
-        
-        # PRIORITY 1: Check for workout plan intent
-        if intent_type == "WORKOUT_PLAN" and confidence > min_confidence and action_detected:
+        # PRIORITY 1: Check for workout plan intent - HANDLE DIRECTLY
+        if intent_type == "WORKOUT_PLAN" and confidence > min_confidence:
             print(f"DEBUG: Workout plan intent detected for: {text}")
-            await mem.set_pending(user_id, {
-                "state": "awaiting_workout_redirect_confirm",
-                "original_text": text.strip()
-            })
-            
-            async def _ask_workout_redirect():
-                redirect_msg = "I can help you create a personalized workout plan! Would you like me to guide you to the workout template section where you can use our Kyra default template or make your own template with more customizing options?"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_msg)
-                yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_redirect_confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            
-            return StreamingResponse(_ask_workout_redirect(), media_type="text/event-stream",
+
+            async def _generate_workout_plan():
+                try:
+                    await mem.add(user_id, "user", text.strip())
+
+                    # Get user profile
+                    profile = fetch_client_profile(db, user_id)
+                    print(f"DEBUG: User profile fetched: {profile}")
+
+                    # Generate workout template
+                    print(f"DEBUG: Generating workout template with AI...")
+                    workout_template = generate_workout_template_with_ai(text, profile, oai)
+                    print(f"DEBUG: Workout template generated: {workout_template is not None}")
+
+                    if workout_template:
+                        # Format the template for display
+                        formatted_template = format_workout_template_display(workout_template)
+
+                        response_message = f"🏋️ I've created a personalized workout template for you!\n\n{formatted_template}\n\n💡 This template is based on your profile and goals. You can modify it anytime by asking me to adjust specific exercises, sets, or reps!"
+
+                        await mem.add(user_id, "assistant", response_message)
+
+                        # Send response with template data
+                        yield sse_json({
+                            "type": "workout_template",
+                            "template": workout_template,
+                            "message": response_message
+                        })
+                    else:
+                        error_msg = "I encountered an issue generating your workout plan. Let me help you with general workout advice instead."
+                        await mem.add(user_id, "assistant", error_msg)
+                        yield sse_escape(error_msg)
+
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                except Exception as e:
+                    print(f"Error generating workout plan: {e}")
+                    import traceback
+                    print(f"Full traceback: {traceback.format_exc()}")
+                    error_msg = "I encountered an issue generating your workout plan. Let me help you with general workout advice instead."
+                    await mem.add(user_id, "assistant", error_msg)
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(_generate_workout_plan(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        # PRIORITY 2: Check for diet plan intent
-        elif intent_type == "DIET_PLAN" and confidence > min_confidence and action_detected:
+        # PRIORITY 2: Check for diet plan intent - HANDLE DIRECTLY
+        elif intent_type == "DIET_PLAN" and confidence > min_confidence:
             print(f"DEBUG: Diet plan intent detected for: {text}")
-            await mem.set_pending(user_id, {
-                "state": "awaiting_diet_redirect_confirm",
-                "original_text": text.strip()
-            })
-            
-            async def _ask_diet_redirect():
-                redirect_msg = "I can help you create a personalized diet plan! Would you like me to guide you to the diet template section where you can build your own custom plan or use our Kyra default template?"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_msg)
-                yield f"data: {json.dumps({'message': redirect_msg, 'type': 'diet_redirect_confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            
-            return StreamingResponse(_ask_diet_redirect(), media_type="text/event-stream",
+
+            async def _generate_diet_plan():
+                try:
+                    await mem.add(user_id, "user", text.strip())
+
+                    # Get user profile
+                    profile = fetch_client_profile(db, user_id)
+                    print(f"DEBUG: User profile fetched for diet: {profile}")
+
+                    # Generate diet template
+                    print(f"DEBUG: Generating diet template with AI...")
+                    diet_template = generate_diet_template_with_ai(text, profile, oai)
+                    print(f"DEBUG: Diet template generated: {diet_template is not None}")
+
+                    if diet_template:
+                        # Format the template for display
+                        formatted_template = format_diet_template_display(diet_template)
+
+                        response_message = f"🍽️ I've created a personalized diet template for you!\n\n{formatted_template}\n\n💡 This diet plan is tailored to your goals and calorie needs. You can modify it anytime by asking me to adjust meals or portions!"
+
+                        await mem.add(user_id, "assistant", response_message)
+
+                        # Send response with template data
+                        yield sse_json({
+                            "type": "diet_template",
+                            "template": diet_template,
+                            "message": response_message
+                        })
+                    else:
+                        error_msg = "I encountered an issue generating your diet plan. Let me help you with general nutrition advice instead."
+                        await mem.add(user_id, "assistant", error_msg)
+                        yield sse_escape(error_msg)
+
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                except Exception as e:
+                    print(f"Error generating diet plan: {e}")
+                    import traceback
+                    print(f"Full traceback: {traceback.format_exc()}")
+                    error_msg = "I encountered an issue generating your diet plan. Let me help you with general nutrition advice instead."
+                    await mem.add(user_id, "assistant", error_msg)
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(_generate_diet_plan(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        # PRIORITY 3: Check for food logging intent
-        elif intent_type == "FOOD_LOGGING" and confidence > min_confidence and action_detected:
+        # PRIORITY 3: Check for food logging intent - HANDLE DIRECTLY
+        elif intent_type == "FOOD_LOGGING" and confidence > min_confidence:
             print(f"DEBUG: Food logging intent detected for: {text}")
-            await mem.set_pending(user_id, {
-                "state": "awaiting_food_redirect_confirm",
-                "original_text": text.strip()
-            })
-            
-            async def _ask_food_redirect():
-                redirect_msg = "I noticed you want to log food! For the best experience with food logging, scanning, and nutrition tracking, would you like me to guide you to the dedicated food logging section?"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_msg)
-                yield f"data: {json.dumps({'message': redirect_msg, 'type': 'food_redirect_confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            
-            return StreamingResponse(_ask_food_redirect(), media_type="text/event-stream",
+
+            async def _handle_food_logging():
+                try:
+                    await mem.add(user_id, "user", text.strip())
+
+                    # Extract food information
+                    food_info = extract_food_info_using_ai(text, oai)
+                    foods = food_info.get("foods", [])
+
+                    if not foods:
+                        error_msg = "I couldn't identify any food items from your message. Could you tell me what you ate? For example: 'I had 2 apples and a bowl of rice'"
+                        await mem.add(user_id, "assistant", error_msg)
+                        yield sse_escape(error_msg)
+                        yield "event: done\ndata: [DONE]\n\n"
+                        return
+
+                    # Process foods - calculate nutrition for those with quantities
+                    logged_foods = []
+                    foods_needing_quantities = []
+
+                    for food in foods:
+                        if food.get('quantity') is not None:
+                            # Calculate nutrition
+                            nutrition = calculate_nutrition_using_ai(
+                                food['name'], food['quantity'], food['unit'], oai
+                            )
+                            food.update(nutrition)
+                            logged_foods.append(food)
+                        else:
+                            foods_needing_quantities.append(food)
+
+                    if logged_foods:
+                        # Store logged foods in database (default to "breakfast" meal)
+                        today_date = datetime.now(IST).strftime("%Y-%m-%d")
+                        store_diet_data_to_db(db, user_id, today_date, logged_foods, "breakfast")
+
+                        # Create summary
+                        food_summaries = []
+                        total_calories = 0
+                        for food in logged_foods:
+                            quantity = food.get('quantity', 0)
+                            unit = food.get('unit', 'pieces')
+                            name = food.get('name', '')
+                            calories = food.get('calories', 0)
+
+                            food_summaries.append(f"{quantity} {unit} of {name}")
+                            total_calories += calories
+
+                        if len(food_summaries) == 1:
+                            message = f"✅ Logged {food_summaries[0]}!"
+                        else:
+                            message = f"✅ Logged {', '.join(food_summaries[:-1])} and {food_summaries[-1]}!"
+
+                        message += f"\n📊 Total: {total_calories} calories added to your food diary"
+
+                        if foods_needing_quantities:
+                            pending_names = [f['name'] for f in foods_needing_quantities]
+                            message += f"\n\n❓ I also noticed: {', '.join(pending_names)}. Would you like to log these too? If yes, please tell me the quantities."
+
+                        await mem.add(user_id, "assistant", message)
+
+                        yield sse_json({
+                            "type": "food_logged",
+                            "logged_foods": logged_foods,
+                            "pending_foods": foods_needing_quantities,
+                            "message": message
+                        })
+                    else:
+                        # All foods need quantities
+                        first_food = foods_needing_quantities[0]
+                        ask_msg = f"Great! I found {first_food['name']}. How much did you have? (e.g., '2 pieces', '1 plate', '100g')"
+
+                        await mem.set_pending(user_id, {
+                            "state": "awaiting_food_quantity",
+                            "foods": foods_needing_quantities,
+                            "current_food_index": 0,
+                            "logged_foods": []
+                        })
+
+                        await mem.add(user_id, "assistant", ask_msg)
+                        yield sse_escape(ask_msg)
+
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                except Exception as e:
+                    print(f"Error handling food logging: {e}")
+                    error_msg = "I encountered an issue logging your food. Please try again or tell me what you ate in a different way."
+                    await mem.add(user_id, "assistant", error_msg)
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(_handle_food_logging(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        # PRIORITY 4: Check for workout logging intent
-        elif intent_type == "WORKOUT_LOGGING" and confidence > min_confidence and action_detected:
+        # PRIORITY 4: Check for workout logging intent - HANDLE DIRECTLY
+        elif intent_type == "WORKOUT_LOGGING" and confidence > min_confidence:
             print(f"DEBUG: Workout logging intent detected for: {text}")
-            await mem.set_pending(user_id, {
-                "state": "awaiting_workout_log_redirect_confirm",
-                "original_text": text.strip()
-            })
-            
-            async def _ask_workout_log_redirect():
-                redirect_msg = "I see you want to log your workout! Would you like me to guide you to the workout logging section where you can track your exercises in your templates?"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_msg)
-                yield f"data: {json.dumps({'message': redirect_msg, 'type': 'workout_log_redirect_confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            
-            return StreamingResponse(_ask_workout_log_redirect(), media_type="text/event-stream",
+
+            async def _handle_workout_logging():
+                try:
+                    await mem.add(user_id, "user", text.strip())
+
+                    # Extract workout information using AI
+                    workout_info = extract_workout_info_using_ai(text, oai)
+                    exercises = workout_info.get("exercises", [])
+
+                    if not exercises:
+                        error_msg = "I couldn't identify any exercises from your message. Could you tell me what exercises you did? For example: 'I did 3 sets of 10 pushups and ran for 30 minutes'"
+                        await mem.add(user_id, "assistant", error_msg)
+                        yield sse_escape(error_msg)
+                        yield "event: done\ndata: [DONE]\n\n"
+                        return
+
+                    # Create workout summary
+                    exercise_summaries = []
+                    for exercise in exercises:
+                        name = exercise.get('name', 'Unknown Exercise')
+                        sets = exercise.get('sets', '')
+                        reps = exercise.get('reps', '')
+                        duration = exercise.get('duration', '')
+
+                        if sets and reps:
+                            exercise_summaries.append(f"{name}: {sets} sets × {reps} reps")
+                        elif duration:
+                            exercise_summaries.append(f"{name}: {duration}")
+                        else:
+                            exercise_summaries.append(name)
+
+                    message = f"🏋️ Great workout! I logged:\n\n"
+                    for i, summary in enumerate(exercise_summaries, 1):
+                        message += f"{i}. {summary}\n"
+
+                    message += f"\n💪 Keep up the excellent work! Remember to stay hydrated and get proper rest for recovery."
+
+                    await mem.add(user_id, "assistant", message)
+
+                    yield sse_json({
+                        "type": "workout_logged",
+                        "exercises": exercises,
+                        "message": message
+                    })
+
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                except Exception as e:
+                    print(f"Error handling workout logging: {e}")
+                    error_msg = "I encountered an issue logging your workout. Please try again or describe your exercises differently."
+                    await mem.add(user_id, "assistant", error_msg)
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(_handle_workout_logging(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         
         # If AI detected an intent but it's informational (not action), continue to normal chat
