@@ -184,7 +184,7 @@ def is_simple_food_mention_with_ai(text: str, oai) -> bool:
         
     except Exception as e:
         print(f"DEBUG: Food AI check error: {e}")
-        # Fallback: if AI fails, be more generous with potential food words
+       
         # Check if it's similar to common food words
         potential_foods = ['apple', 'banana', 'orange', 'mango', 'rice', 'chicken', 'fish', 'bread', 'milk', 'egg']
         text_lower = text.lower()
@@ -974,10 +974,15 @@ async def chat_stream(
         'controlled_ask_days', 'controlled_ask_names', 'controlled_generate'
     ]
 
-    # Food template chatbot states (from food_template.py)
+    # Food template chatbot states (from food_template.py) - COMPLETE LIST
     food_template_states = [
         'awaiting_diet_preference', 'awaiting_cuisine_preference',
-        'awaiting_confirmation', 'template_ready', 'awaiting_edit_request'
+        'awaiting_confirmation', 'template_ready', 'awaiting_edit_request',
+        'awaiting_name_change_or_edit', 'awaiting_removal_items',
+        'awaiting_edit_type', 'awaiting_bulk_edit', 'template_generated',
+        'meal_plan_ready', 'awaiting_save_confirmation',
+        'awaiting_day_selection', 'awaiting_all_names', 'awaiting_selected_names',
+        'awaiting_name_change_after_allergy'
     ]
 
     if current_state in workout_template_states:
@@ -1000,6 +1005,7 @@ async def chat_stream(
         print(f"DEBUG: Continuing food template conversation in state: {current_state}")
         if food_template_chat_stream:
             try:
+                print(f"DEBUG: Calling food_template_chat_stream for state: {current_state}")
                 return await food_template_chat_stream(
                     user_id=user_id,
                     client_id=user_id,
@@ -1010,8 +1016,34 @@ async def chat_stream(
                 )
             except Exception as e:
                 print(f"Error continuing food template conversation: {e}")
-                # Clear the state and continue with normal chat
+                import traceback
+                print(f"Food template error traceback: {traceback.format_exc()}")
+
+                # Clear the state and show error message
                 await mem.set_pending(user_id, None)
+
+                async def _food_template_error():
+                    error_msg = "I encountered an issue with the meal planner. Let me help you with general nutrition advice instead."
+                    await mem.add(user_id, "user", text.strip())
+                    await mem.add(user_id, "assistant", error_msg)
+                    yield sse_escape(error_msg)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_food_template_error(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        else:
+            print("ERROR: food_template_chat_stream function not available")
+            await mem.set_pending(user_id, None)
+
+            async def _no_food_function():
+                error_msg = "Meal planner is not available. Let me help you with general nutrition advice instead."
+                await mem.add(user_id, "user", text.strip())
+                await mem.add(user_id, "assistant", error_msg)
+                yield sse_escape(error_msg)
+                yield "event: done\ndata: [DONE]\n\n"
+
+            return StreamingResponse(_no_food_function(), media_type="text/event-stream",
+                                   headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
     if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
