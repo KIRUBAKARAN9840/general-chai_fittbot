@@ -31,6 +31,14 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_struc
     StructurizeAndSaveRequest, structurize_and_save
 )
 
+# Import workout logging functions
+from app.fittbot_api.v1.client.client_api.chatbot.codes.workout_log import (
+    extract_exercises_using_openai, parse_reps_and_sets, create_workout_response,
+    save_workout_to_database, _fetch_profile, is_cardio_exercise,
+    parse_cardio_duration, create_cardio_sets, create_exercise_sets,
+    get_muscle_group_for_exercise
+)
+
 # Import workout template chatbot classes (we'll need to copy them here or import directly)
 # For now, let's import the main function directly
 import importlib.util
@@ -69,6 +77,23 @@ def import_food_template_function():
 
 # Import the food template function
 food_template_chat_stream = import_food_template_function()
+
+def import_workout_log_function():
+    """Import the workout_chat_stream_internal function"""
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "workout_log_chatbot",
+            "/Users/admin/Desktop/fittbot_test/Combined backend 24092025/app/fittbot_api/v1/client/client_api/chatbot/codes/workout_log.py"
+        )
+        workout_log_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(workout_log_module)
+        return workout_log_module.workout_chat_stream_internal
+    except Exception as e:
+        print(f"Failed to import workout log function: {e}")
+        return None
+
+# Import the workout log function
+workout_log_chat_stream = import_workout_log_function()
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.report_analysis import (
     is_analysis_intent, is_followup_question, set_mode, get_mode,
     set_analysis_artifacts, get_analysis_artifacts, build_analysis_dataset_dict,
@@ -369,6 +394,20 @@ def calculate_nutrition_using_ai(food_name, quantity, unit, oai):
     except Exception as e:
         print(f"AI nutrition calculation failed: {e}")
         return {"calories": 100, "protein": 3, "carbs": 15, "fat": 2, "fiber": 1, "sugar": 2}
+
+def get_current_meal_based_on_time():
+    """Determine current meal based on IST time"""
+    current_time = datetime.now(IST).time()
+    hour = current_time.hour
+
+    if 6 <= hour < 11:
+        return "breakfast"
+    elif 11 <= hour < 16:
+        return "lunch"
+    elif 16 <= hour < 21:
+        return "dinner"
+    else:
+        return "snack"
 
 def store_diet_data_to_db(db: Session, client_id: int, date: str, logged_foods: list, meal: str):
     """Store logged food data in actual_diet table"""
@@ -694,54 +733,6 @@ def format_workout_template_display(template: dict) -> str:
 
     return "\n".join(formatted_lines)
 
-def extract_workout_info_using_ai(text: str, oai):
-    """Extract workout information using AI"""
-    try:
-        prompt = f"""
-        Analyze this text and extract workout/exercise information: "{text}"
-
-        Extract any exercises mentioned along with sets, reps, and duration if provided.
-
-        Return ONLY valid JSON array:
-        [
-            {{
-                "name": "exercise_name",
-                "sets": number_or_null,
-                "reps": number_or_null,
-                "duration": "time_string_or_null",
-                "weight": "weight_string_or_null"
-            }}
-        ]
-
-        Examples:
-        - "I did 3 sets of 10 pushups" → [{{"name": "pushups", "sets": 3, "reps": 10, "duration": null, "weight": null}}]
-        - "ran for 30 minutes" → [{{"name": "running", "sets": null, "reps": null, "duration": "30 minutes", "weight": null}}]
-        - "bench press with 60kg, 3 sets of 8" → [{{"name": "bench press", "sets": 3, "reps": 8, "duration": null, "weight": "60kg"}}]
-        """
-
-        response = oai.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a fitness expert. Extract workout information accurately and return only valid JSON."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=500,
-            temperature=0.1
-        )
-
-        result = response.choices[0].message.content.strip()
-        result = re.sub(r"^```json\s*", "", result)
-        result = re.sub(r"\s*```$", "", result)
-
-        exercises = json.loads(result)
-        if not isinstance(exercises, list):
-            exercises = [exercises] if isinstance(exercises, dict) else []
-
-        return {"exercises": exercises}
-
-    except Exception as e:
-        print(f"Workout extraction error: {e}")
-        return {"exercises": []}
 
 def parse_quantity_input(text: str):
     """Parse quantity input from user"""
@@ -835,83 +826,222 @@ def format_diet_template_display(template: dict) -> str:
     return "\n".join(formatted_lines)
 
 def detect_user_intent_with_ai(text: str, oai) -> dict:
-    """Use AI to detect user intent with improved accuracy and specificity"""
-    
+    """Enhanced AI intent detection with better keyword analysis and context understanding"""
+
+    # First, perform keyword-based pre-analysis for better context
+    text_lower = text.lower().strip()
+
+    # Define keyword patterns with context
+    patterns = {
+        "WORKOUT_PLAN": {
+            "primary": ["workout plan", "exercise plan", "training plan", "fitness plan", "routine plan"],
+            "secondary": ["plan workout", "create workout", "design workout", "make workout", "workout template"],
+            "verbs": ["create", "make", "design", "build", "plan", "generate", "develop"],
+            "contexts": ["plan", "routine", "program", "template", "schedule"],
+            "exclude": ["did", "completed", "finished", "ate", "had"]
+        },
+        "DIET_PLAN": {
+            "primary": ["diet plan", "meal plan", "nutrition plan", "eating plan", "food plan"],
+            "secondary": ["plan diet", "create diet", "meal template", "diet template"],
+            "verbs": ["create", "make", "design", "build", "plan", "generate", "develop"],
+            "contexts": ["plan", "template", "guide", "schedule", "program"],
+            "exclude": ["ate", "had", "consumed", "finished"]
+        },
+        "WORKOUT_LOGGING": {
+            "primary": ["I did", "I completed", "I finished", "just did", "done with"],
+            "secondary": ["completed workout", "finished workout", "did exercise"],
+            "verbs": ["did", "completed", "finished", "done"],
+            "contexts": ["sets", "reps", "minutes", "times", "workout", "exercise"],
+            "exercise_indicators": ["pushups", "squats", "running", "cycling", "lifting"]
+        },
+        "FOOD_LOGGING": {
+            "primary": ["I ate", "I had", "I consumed", "just ate", "just had", "log ", "track "],
+            "secondary": ["ate", "had", "consumed", "finished eating", "add food", "record food"],
+            "verbs": ["ate", "had", "consumed", "finished", "log", "track", "add", "record"],
+            "contexts": ["breakfast", "lunch", "dinner", "snack", "food", "meal"],
+            "food_indicators": ["rice", "bread", "apple", "chicken", "pizza", "salad", "idli", "dosa", "chapati", "dal", "curry"]
+        }
+    }
+
+    # Enhanced prompt with better context analysis
     prompt = f"""
-    Analyze this user message and determine their SPECIFIC intent: "{text}"
-    
-    BE VERY LIBERAL with intent detection. Detect these intents:
+    Analyze this user message with DEEP CONTEXT UNDERSTANDING: "{text}"
 
-    1. WORKOUT_PLAN: User wants a workout plan, exercise routine, or training program
-       - Examples: "workout plan", "exercise routine", "training program", "fitness plan", "workout for weight loss"
-       - Keywords: workout, exercise, training, fitness + plan/routine/program/template
-       - BE LIBERAL: Even questions like "workout plan for beginners" should be WORKOUT_PLAN
-       - Handle typos: "worutplan", "workoutplan", "excersize plan"
+    Consider:
+    1. SENTENCE STRUCTURE: Is this a request, statement, question, or command?
+    2. VERB TENSE: Past tense (logging) vs Future/Present (planning)
+    3. SPECIFICITY: General info vs Specific action request
+    4. KEYWORDS IN CONTEXT: Same keywords can mean different things
 
-    2. DIET_PLAN: User wants a complete diet plan, meal plan, or structured eating template
-       - Examples: "diet plan", "meal plan", "nutrition plan", "eating plan", "food plan", "create diet template"
-       - Keywords: diet, meal, eating + plan/template/guide/schedule/program
-       - Must indicate desire for a STRUCTURED PLAN, not just information
-       - NOT for simple nutrition questions like "calories in X" or "nutrition value of Y"
-       - Handle typos: "deit plan", "meal templete", "mealplan"
+    INTENT CATEGORIES WITH ENHANCED ANALYSIS:
 
-    3. FOOD_LOGGING: User mentions eating/consuming food - BE EXTREMELY LIBERAL
-       - Examples: "I ate rice", "had breakfast", "consumed apple", "ate pizza", just mentions food names
-       - Key phrases: "I ate", "I had", "I consumed", "I finished", "just ate", "just had"
-       - BE GENEROUS: ANY mention of eating/consuming food is likely logging intent
-       - Even simple food names like "apple", "rice" should be FOOD_LOGGING
+    🎯 WORKOUT_PLAN: User wants to CREATE/GET a workout routine
+    ✅ Strong indicators:
+    - Action verbs: "create", "make", "design", "build", "plan", "need", "want"
+    - Planning keywords: "plan", "routine", "program", "template", "schedule"
+    - Future/present tense: "I want to...", "Can you create...", "Help me make..."
+    - Examples: "create workout plan", "I need exercise routine", "design training program"
 
-    4. WORKOUT_LOGGING: User wants to LOG/RECORD completed exercises (past tense, successful completion)
-       - Examples: "I did 50 pushups", "completed my workout", "finished training", "did 3 sets of squats"
-       - Key phrases: "I did", "I completed", "I finished", "just did", "done with" + specific exercise details
-       - Must indicate SUCCESSFUL COMPLETION, not problems or questions
-       - NOT for health issues, pain, or advice requests during workouts
+    ❌ NOT workout plan:
+    - Past tense completions: "I did pushups" (that's WORKOUT_LOGGING)
+    - Just exercise names: "pushups" (that's NONE - answer question)
+    - Info questions: "what exercises for abs?" (that's NONE)
 
-    5. NONE: For general fitness advice, health questions, information requests, or unrelated topics
-       - Examples: "I got headache during workout", "why do I feel pain", "what causes muscle soreness"
-       - Includes: health issues, workout problems, general fitness advice, nutrition information
+    🍽️ DIET_PLAN: User wants to CREATE/GET a meal/diet plan
+    ✅ Strong indicators:
+    - Planning verbs: "create", "make", "plan", "design", "need", "want"
+    - Diet/meal planning: "diet plan", "meal plan", "nutrition plan", "eating schedule"
+    - Structured request: asking for organized eating template
+    - Examples: "create diet plan", "I need meal template", "design nutrition program"
 
-    CRITICAL RULES:
-    - Simple mentions of food consumption = FOOD_LOGGING
-    - Any request for plans/routines = corresponding PLAN intent
-    - Past tense SUCCESSFUL workout completion = WORKOUT_LOGGING
-    - Health issues, pain, problems, or advice requests = NONE (general chat)
-    - Nutrition information questions (e.g., "calories in X", "nutrition value of Y") = NONE (general chat)
-    - When in doubt between action intents, choose the most specific one
-    - Confidence should be HIGH for obvious matches
-    
+    ❌ NOT diet plan:
+    - Past tense eating: "I ate rice" (that's FOOD_LOGGING)
+    - Nutrition questions: "calories in apple?" (that's NONE)
+
+    🏋️ WORKOUT_LOGGING: User COMPLETED exercises and wants to LOG them
+    ✅ Strong indicators:
+    - Past tense verbs: "did", "completed", "finished", "done"
+    - Personal statements: "I did...", "I completed...", "just finished..."
+    - Specific details: numbers, sets, reps, duration mentioned
+    - Examples: "I did 50 pushups", "completed 3 sets squats", "finished my workout"
+
+    ❌ NOT workout logging:
+    - Future planning: "I want to do pushups" (might be WORKOUT_PLAN)
+    - Questions: "how many pushups should I do?" (that's NONE)
+
+    🍎 FOOD_LOGGING: User ATE/CONSUMED food OR wants to LOG/TRACK food
+    ✅ Strong indicators:
+    - Past consumption: "ate", "had", "consumed", "finished eating"
+    - Personal statements: "I ate...", "I had...", "just had..."
+    - Logging commands: "log [FOOD_ITEM]", "track [FOOD_ITEM]", "add [FOOD_ITEM]", "record [FOOD_ITEM]"
+    - Food mentions: ACTUAL food names with consumption/logging context
+    - IMPORTANT: "log/track/add" + ACTUAL FOOD = FOOD_LOGGING
+    - Examples: "I ate rice", "had breakfast", "log idli", "track pizza", "add chicken"
+
+    ❌ NOT food logging:
+    - Recipe requests: "how to cook rice?" (that's NONE)
+    - Nutrition questions: "calories in rice?" (that's NONE)
+    - EXERCISE logging: "log pushup", "track workout", "log squats" = WORKOUT_LOGGING
+    - CRITICAL: Distinguish FOOD vs EXERCISE in logging commands!
+
+    ❓ NONE: General questions, advice, info requests, health issues
+    - Questions without action intent: "what exercises for abs?", "why does my back hurt?"
+    - Information requests: "calories in apple", "benefits of running"
+    - Health problems: "I have pain", "feeling tired"
+
+    CONTEXT ANALYSIS RULES:
+    1. TENSE MATTERS: Past = logging, Future/Present = planning
+    2. VERB TYPE: Action verbs (create, make) = planning, Past verbs (did, ate) = logging
+    3. SPECIFICITY: Specific details + past tense = logging
+    4. QUESTION TYPE: "How to..." = info (NONE), "Create..." = planning
+    5. ITEM TYPE DISTINCTION:
+       - EXERCISES: pushup, squat, deadlift, bench press, running, cycling, etc.
+       - FOODS: rice, bread, apple, chicken, pizza, idli, dosa, dal, etc.
+    6. LOGGING COMMANDS: "log/track/add [ITEM]" → Check if ITEM is food or exercise:
+       - "log rice", "track apple" = FOOD_LOGGING
+       - "log pushup", "track workout", "log squats" = WORKOUT_LOGGING
+
+    CONFIDENCE SCORING:
+    - 0.9-1.0: Clear intent with strong indicators
+    - 0.7-0.8: Good indicators but some ambiguity
+    - 0.5-0.6: Weak indicators, could be multiple intents
+    - 0.3-0.4: Very unclear, leaning toward NONE
+
     Return JSON:
     {{
         "intent": "WORKOUT_PLAN|DIET_PLAN|FOOD_LOGGING|WORKOUT_LOGGING|NONE",
         "confidence": 0.0-1.0,
-        "reasoning": "brief explanation of why this intent was chosen",
-        "action_detected": true/false
+        "reasoning": "detailed explanation including tense analysis, verb type, and context",
+        "action_detected": true/false,
+        "key_indicators": ["list", "of", "detected", "keywords"],
+        "sentence_type": "request|statement|question|command"
     }}
     """
-    
+
     try:
         response = oai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are an intent classifier. BE LIBERAL - when in doubt, choose an action intent. Fitness-related requests usually want plans or logging. Be generous with confidence scores."
+                    "content": "You are an expert intent classifier with deep understanding of context, grammar, and user psychology. Analyze sentence structure, verb tense, and semantic meaning - not just keywords. Be precise and confident in your analysis. CRITICAL: Distinguish between FOOD and EXERCISE items in logging commands. 'log rice' = FOOD_LOGGING, but 'log pushup' = WORKOUT_LOGGING. Context and item type matter more than just the verb 'log'."
                 },
                 {"role": "user", "content": prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0
+            temperature=0.1  # Slightly higher for better reasoning
         )
-        
+
         result = response.choices[0].message.content.strip()
         intent_data = json.loads(result)
-        
-        print(f"DEBUG AI Intent Detection: '{text}' → {intent_data}")
+
+        # Add fallback keyword analysis if AI confidence is low
+        if intent_data.get("confidence", 0) < 0.5:
+            fallback_intent = _keyword_fallback_analysis(text_lower, patterns)
+            if fallback_intent:
+                intent_data["intent"] = fallback_intent["intent"]
+                intent_data["confidence"] = max(intent_data.get("confidence", 0), fallback_intent["confidence"])
+                intent_data["reasoning"] += f" | Fallback: {fallback_intent['reasoning']}"
+
+        print(f"DEBUG Enhanced AI Intent Detection: '{text}' → {intent_data}")
         return intent_data
-        
+
     except Exception as e:
         print(f"DEBUG AI Intent Detection Error: {e}")
-        return {"intent": "NONE", "confidence": 0.0, "reasoning": "error", "action_detected": False}
+        # Fallback to keyword analysis if AI fails
+        fallback = _keyword_fallback_analysis(text_lower, patterns)
+        if fallback:
+            return fallback
+        return {"intent": "NONE", "confidence": 0.0, "reasoning": "error in detection", "action_detected": False}
+
+def _keyword_fallback_analysis(text_lower: str, patterns: dict) -> dict:
+    """Fallback keyword-based analysis when AI detection has low confidence"""
+
+    for intent, pattern_data in patterns.items():
+        score = 0
+        found_keywords = []
+
+        # Check primary patterns (high weight)
+        for primary in pattern_data["primary"]:
+            if primary in text_lower:
+                score += 3
+                found_keywords.append(primary)
+
+        # Check secondary patterns (medium weight)
+        for secondary in pattern_data["secondary"]:
+            if secondary in text_lower:
+                score += 2
+                found_keywords.append(secondary)
+
+        # Check verbs and contexts (low weight)
+        for verb in pattern_data.get("verbs", []):
+            if verb in text_lower:
+                score += 1
+                found_keywords.append(verb)
+
+        for context in pattern_data.get("contexts", []):
+            if context in text_lower:
+                score += 1
+                found_keywords.append(context)
+
+        # Check exclusion patterns (negative weight)
+        for exclude in pattern_data.get("exclude", []):
+            if exclude in text_lower:
+                score -= 2
+
+        # Return intent if score is high enough
+        if score >= 3:
+            confidence = min(0.8, score * 0.15)  # Cap at 0.8 for keyword-only detection
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "reasoning": f"Keyword analysis: found {found_keywords}",
+                "action_detected": True,
+                "key_indicators": found_keywords,
+                "sentence_type": "statement"
+            }
+
+    return None
 
 @router.get("/healthz")
 async def healthz():
@@ -991,6 +1121,11 @@ async def chat_stream(
         'awaiting_name_change_after_allergy'
     ]
 
+    # Workout logging states (from workout_log.py) - COMPLETE LIST
+    workout_logging_states = [
+        'awaiting_sets_reps', 'awaiting_intensity', 'awaiting_duration'
+    ]
+
     if current_state in workout_template_states:
         print(f"DEBUG: Continuing workout template conversation in state: {current_state}")
         if ultra_flexible_workout_stream:
@@ -1051,6 +1186,24 @@ async def chat_stream(
             return StreamingResponse(_no_food_function(), media_type="text/event-stream",
                                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
+    elif current_state in workout_logging_states:
+        print(f"DEBUG: Continuing workout logging conversation in state: {current_state}")
+        if workout_log_chat_stream:
+            try:
+                return await workout_log_chat_stream(
+                    user_id=user_id,
+                    text=text,
+                    mem=mem,
+                    db=db
+                )
+            except Exception as e:
+                print(f"Error continuing workout logging conversation: {e}")
+                # Clear the state and continue with normal chat
+                await mem.set_pending(user_id, None)
+        else:
+            print("ERROR: workout_log_chat_stream function not available")
+            await mem.set_pending(user_id, None)
+
     if is_plan_request(tlower):
         await set_mode(mem, user_id, None)
 
@@ -1103,212 +1256,68 @@ async def chat_stream(
         return StreamingResponse(_nav_clar(), media_type="text/event-stream",
                                  headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-    # Handle workout plan confirmation
-    if pend.get("state") == "awaiting_workout_redirect_confirm":
-        if is_yes(text):
-            await mem.set_pending(user_id, None)
-            async def _redirect_to_workout_plan():
-                redirect_message = "Excellent! To create your personalized workout plan, go to: Home → Workout → Here you can find the 'Kyra default template' for workouts, or choose 'Make your own template' for more customizing options!"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_message)
-                yield sse_json({
-                    "type": "workout_plan_redirect",
-                    "redirect": True,
-                    "message": redirect_message,
-                    "navigation_path": "Home → Workout → Templates"
-                })
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_redirect_to_workout_plan(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        elif is_no(text):
-            await mem.set_pending(user_id, None)
-            # Continue with normal chat - fall through
-        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            async def _workout_redirect_clarify():
-                clarify_msg = "Would you like me to guide you to the workout template creation section? Please say yes or no."
-                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_workout_redirect_clarify(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            print(f"DEBUG: Clearing workout redirect state due to topic change to: {text}")
-            await mem.set_pending(user_id, None)
-
-    # Handle diet plan confirmation
-    if pend.get("state") == "awaiting_diet_redirect_confirm":
-        if is_yes(text):
-            await mem.set_pending(user_id, None)
-            async def _redirect_to_diet_plan():
-                redirect_message = "Great! To create your personalized diet plan, go to: Home → Diet → Here you can create your own food template or use the 'Kyra default template' as a starting point!"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_message)
-                yield sse_json({
-                    "type": "diet_plan_redirect",
-                    "redirect": True,
-                    "message": redirect_message,
-                    "navigation_path": "Home → Diet → Create Template"
-                })
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_redirect_to_diet_plan(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        elif is_no(text):
-            await mem.set_pending(user_id, None)
-            # Continue with normal chat - fall through
-        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            async def _diet_redirect_clarify():
-                clarify_msg = "Would you like me to guide you to the diet template creation section? Please say yes or no."
-                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_diet_redirect_clarify(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            print(f"DEBUG: Clearing diet redirect state due to topic change to: {text}")
-            await mem.set_pending(user_id, None)
-
-    # Handle food logging confirmation
-    if pend.get("state") == "awaiting_food_redirect_confirm":
-        if is_yes(text):
-            await mem.set_pending(user_id, None)
-            async def _redirect_to_food_log():
-                redirect_message = "Perfect! To log your food, go to: Home → Diet → Log food with Kyra AI. There you can log food by name or even scan items!"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_message)
-                yield sse_json({
-                    "type": "food_log_redirect",
-                    "redirect": True,
-                    "message": redirect_message,
-                    "navigation_path": "Home → Diet → Log food with Kyra AI"
-                })
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_redirect_to_food_log(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        elif is_no(text):
-            await mem.set_pending(user_id, None)
-            # Continue with normal chat - fall through
-        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            async def _food_redirect_clarify():
-                clarify_msg = "Would you like me to guide you to the food logging section? Please say yes or no."
-                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_food_redirect_clarify(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            print(f"DEBUG: Clearing food redirect state due to topic change to: {text}")
-            await mem.set_pending(user_id, None)
-
-    # Handle food quantity input (NEW INTEGRATED FUNCTIONALITY)
+    # Handle food quantity input
     if pend.get("state") == "awaiting_food_quantity":
         print("DEBUG: In awaiting_food_quantity state")
         try:
-            foods = pend.get("foods", [])
-            current_index = pend.get("current_food_index", 0)
-            current_food = foods[current_index] if current_index < len(foods) else None
-            logged_foods = pend.get("logged_foods", [])
-
-            if not current_food:
-                print("DEBUG: No current food found, clearing state")
+            item_name = pend.get("item_name", "")
+            if not item_name:
                 await mem.set_pending(user_id, None)
-                async def _error_no_food():
+                async def _restart_food():
                     yield sse_escape("Something went wrong. Please tell me what you ate again.")
                     yield "event: done\ndata: [DONE]\n\n"
-                return StreamingResponse(_error_no_food(), media_type="text/event-stream",
+                return StreamingResponse(_restart_food(), media_type="text/event-stream",
                                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-            # Parse quantity from input
-            quantity, unit = parse_quantity_input(text)
+            # Extract quantity information from user input
+            food_info = extract_food_info_using_ai(f"{text} {item_name}", oai)
+            foods = food_info.get("foods", [])
 
-            if quantity is not None:
-                print(f"DEBUG: Parsed quantity: {quantity} {unit} for {current_food['name']}")
+            # Clear pending state
+            await mem.set_pending(user_id, None)
 
-                # Use default unit if none provided
-                if not unit:
-                    unit = current_food.get('unit', 'pieces')
-
-                # Update food with quantity and calculate nutrition
-                foods[current_index]["quantity"] = quantity
-                foods[current_index]["unit"] = unit
-
+            if foods and foods[0].get('quantity') is not None:
+                food = foods[0]
+                # Calculate nutrition
                 nutrition = calculate_nutrition_using_ai(
-                    current_food['name'], quantity, unit, oai
+                    food['name'], food['quantity'], food['unit'], oai
                 )
-                foods[current_index].update(nutrition)
+                food.update(nutrition)
 
-                # Move to logged foods
-                logged_foods.append(foods[current_index])
+                # Store in database (determine meal based on current time)
+                current_meal = get_current_meal_based_on_time()
+                today_date = datetime.now(IST).strftime("%Y-%m-%d")
+                store_diet_data_to_db(db, user_id, today_date, [food], current_meal)
 
-                # Check for next food needing quantity
-                next_food_index = -1
-                for i in range(current_index + 1, len(foods)):
-                    if foods[i].get("quantity") is None:
-                        next_food_index = i
-                        break
+                # Create success message
+                quantity = food.get('quantity', 0)
+                unit = food.get('unit', 'pieces')
+                name = food.get('name', item_name)
+                calories = food.get('calories', 0)
 
-                if next_food_index != -1:
-                    # Ask for next food quantity
-                    next_food = foods[next_food_index]
-                    ask_msg = f"Great! Now, how much {next_food['name']} did you have? (Enter the quantity)"
+                success_message = f"✅ Logged {quantity} {unit} of {name}!\n📊 Total: {calories} calories added to your {current_meal} diary"
+                await mem.add(user_id, "assistant", success_message)
 
-                    await mem.set_pending(user_id, {
-                        "state": "awaiting_food_quantity",
-                        "foods": foods,
-                        "current_food_index": next_food_index,
-                        "logged_foods": logged_foods
+                async def _food_logged():
+                    yield sse_json({
+                        "type": "food_logged",
+                        "logged_foods": [food],
+                        "message": success_message
                     })
-
-                    async def _ask_next_quantity():
-                        yield sse_escape(ask_msg)
-                        yield "event: done\ndata: [DONE]\n\n"
-
-                    return StreamingResponse(_ask_next_quantity(), media_type="text/event-stream",
-                                           headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-                else:
-                    # All foods processed, log everything
-                    await mem.set_pending(user_id, None)
-
-                    # Store to database
-                    today_date = datetime.now(IST).strftime("%Y-%m-%d")
-                    store_diet_data_to_db(db, user_id, today_date, logged_foods, "breakfast")
-
-                    # Create summary
-                    food_summaries = []
-                    total_calories = 0
-                    for food in logged_foods:
-                        food_summaries.append(f"{food['quantity']} {food['unit']} of {food['name']}")
-                        total_calories += food.get('calories', 0)
-
-                    if len(food_summaries) == 1:
-                        message = f"✅ Logged {food_summaries[0]}!"
-                    else:
-                        message = f"✅ Logged {', '.join(food_summaries[:-1])} and {food_summaries[-1]}!"
-
-                    message += f"\n📊 Total: {total_calories} calories added to your food diary"
-
-                    await mem.add(user_id, "user", text.strip())
-                    await mem.add(user_id, "assistant", message)
-
-                    async def _final_food_log():
-                        yield sse_json({
-                            "type": "food_logged",
-                            "logged_foods": logged_foods,
-                            "message": message
-                        })
-                        yield "event: done\ndata: [DONE]\n\n"
-
-                    return StreamingResponse(_final_food_log(), media_type="text/event-stream",
-                                           headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-            else:
-                # Ask again for valid quantity
-                ask_msg = f"Please enter a valid quantity for {current_food['name']}. For example: '2', '1.5 plates', or '100g'"
-
-                async def _ask_quantity_again():
-                    yield sse_escape(ask_msg)
                     yield "event: done\ndata: [DONE]\n\n"
 
-                return StreamingResponse(_ask_quantity_again(), media_type="text/event-stream",
+                return StreamingResponse(_food_logged(), media_type="text/event-stream",
                                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                error_message = f"I couldn't understand the quantity. Please tell me how much {item_name} you had (e.g., '2 pieces', '1 plate', '100g')"
 
-        except Exception as e:
-            print(f"Error processing food quantity: {e}")
+                async def _quantity_error():
+                    yield sse_escape(error_message)
+                    yield "event: done\ndata: [DONE]\n\n"
+
+                return StreamingResponse(_quantity_error(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+        except:
             await mem.set_pending(user_id, None)
             async def _quantity_error():
                 yield sse_escape("Something went wrong. Please tell me what you ate again.")
@@ -1464,36 +1473,6 @@ What would you prefer for your {days_count} workout days?"""
             return StreamingResponse(_error(), media_type="text/event-stream",
                                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-    # Handle workout logging confirmation
-    if pend.get("state") == "awaiting_workout_log_redirect_confirm":
-        if is_yes(text):
-            await mem.set_pending(user_id, None)
-            async def _redirect_to_workout_log():
-                redirect_message = "Great! To log your workout, go to: Home → Workout → Here you can find your templates and log exercises in your existing template, or create a new workout template!"
-                await mem.add(user_id, "user", text.strip())
-                await mem.add(user_id, "assistant", redirect_message)
-                yield sse_json({
-                    "type": "workout_log_redirect",
-                    "redirect": True,
-                    "message": redirect_message,
-                    "navigation_path": "Home → Workout → Templates & Logging"
-                })
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_redirect_to_workout_log(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        elif is_no(text):
-            await mem.set_pending(user_id, None)
-            # Continue with normal chat - fall through
-        elif any(word in text.lower() for word in ['yes', 'no', 'yeah', 'nope', 'sure', 'nah']):
-            async def _workout_log_redirect_clarify():
-                clarify_msg = "Would you like me to guide you to the workout logging section? Please say yes or no."
-                yield f"data: {json.dumps({'message': clarify_msg, 'type': 'confirm'})}\n\n"
-                yield "event: done\ndata: [DONE]\n\n"
-            return StreamingResponse(_workout_log_redirect_clarify(), media_type="text/event-stream",
-                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-        else:
-            print(f"DEBUG: Clearing workout log redirect state due to topic change to: {text}")
-            await mem.set_pending(user_id, None)
 
     # First check if there are clear action indicators OR if it's a fitness-related question
     has_action = has_action_indicators(text)
@@ -1530,14 +1509,18 @@ What would you prefer for your {days_count} workout days?"""
             print(f"DEBUG: AI determined '{text}' is not a food item")
     
     # Run AI intent detection more aggressively - check for any fitness-related content
+    # BUT SKIP if we're in workout logging states to prevent collision
     should_check_intent = (
-        has_action or
+        current_state not in workout_logging_states and  # NEW: Skip intent detection if in workout logging
+        (has_action or
         is_fitness_question or
         any(word in text.lower() for word in ['workout', 'exercise', 'diet', 'meal', 'plan', 'routine', 'training', 'fitness', 'nutrition']) or
-        len(text.split()) <= 5  # Also check short phrases that might be plans
+        len(text.split()) <= 5)  # Also check short phrases that might be plans
     )
 
     print(f"DEBUG: should_check_intent={should_check_intent}")
+    if current_state in workout_logging_states:
+        print(f"DEBUG: Skipping intent detection - in workout logging state: {current_state}")
 
     # Run AI intent detection for action requests OR fitness questions (to catch edge cases)
     if should_check_intent:
@@ -1693,9 +1676,10 @@ How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
                             foods_needing_quantities.append(food)
 
                     if logged_foods:
-                        # Store logged foods in database (default to "breakfast" meal)
+                        # Store logged foods in database (determine meal based on current time)
+                        current_meal = get_current_meal_based_on_time()
                         today_date = datetime.now(IST).strftime("%Y-%m-%d")
-                        store_diet_data_to_db(db, user_id, today_date, logged_foods, "breakfast")
+                        store_diet_data_to_db(db, user_id, today_date, logged_foods, current_meal)
 
                         # Create summary
                         food_summaries = []
@@ -1714,7 +1698,7 @@ How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
                         else:
                             message = f"✅ Logged {', '.join(food_summaries[:-1])} and {food_summaries[-1]}!"
 
-                        message += f"\n📊 Total: {total_calories} calories added to your food diary"
+                        message += f"\n📊 Total: {total_calories} calories added to your {current_meal} diary"
 
                         if foods_needing_quantities:
                             pending_names = [f['name'] for f in foods_needing_quantities]
@@ -1729,19 +1713,31 @@ How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
                             "message": message
                         })
                     else:
-                        # All foods need quantities
-                        first_food = foods_needing_quantities[0]
-                        ask_msg = f"Great! I found {first_food['name']}. How much did you have? (e.g., '2 pieces', '1 plate', '100g')"
+                        # All foods need quantities - ask for quantity inline (restore previous behavior)
+                        if len(foods_needing_quantities) == 1:
+                            food_name = foods_needing_quantities[0]['name']
 
-                        await mem.set_pending(user_id, {
-                            "state": "awaiting_food_quantity",
-                            "foods": foods_needing_quantities,
-                            "current_food_index": 0,
-                            "logged_foods": []
-                        })
+                            # Set pending state to wait for quantity
+                            await mem.set_pending(user_id, {
+                                "state": "awaiting_food_quantity",
+                                "item_name": food_name
+                            })
 
-                        await mem.add(user_id, "assistant", ask_msg)
-                        yield sse_escape(ask_msg)
+                            ask_msg = f"Great! I found {food_name}. How much did you have? (e.g., '2 pieces', '1 plate', '100g')"
+                            await mem.add(user_id, "assistant", ask_msg)
+                            yield sse_escape(ask_msg)
+                        else:
+                            # Multiple foods without quantities - still redirect for complex cases
+                            redirect_msg = "I found multiple food items, but I need quantity information to log them properly. For detailed food logging with quantities, please go to: Home → Diet → Log food with Kyra AI. There you can log food with specific quantities and even scan items!"
+
+                            await mem.add(user_id, "assistant", redirect_msg)
+                            yield sse_json({
+                                "type": "food_log_redirect",
+                                "redirect": True,
+                                "message": redirect_msg,
+                                "navigation_path": "Home → Diet → Log food with Kyra AI",
+                                "detected_foods": [f['name'] for f in foods_needing_quantities]
+                            })
 
                     yield "event: done\ndata: [DONE]\n\n"
 
@@ -1755,65 +1751,37 @@ How many days per week would you like to work out? (e.g., 3, 4, 5, or 6 days)"""
             return StreamingResponse(_handle_food_logging(), media_type="text/event-stream",
                                     headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
-        # PRIORITY 4: Check for workout logging intent - HANDLE DIRECTLY
+        # PRIORITY 4: Check for workout logging intent - REDIRECT TO WORKOUT_LOG.PY
         elif intent_type == "WORKOUT_LOGGING" and confidence > min_confidence:
-            print(f"DEBUG: Workout logging intent detected for: {text}")
-
-            async def _handle_workout_logging():
+            print(f"DEBUG: Workout logging intent detected, redirecting to workout_log.py")
+            if workout_log_chat_stream:
                 try:
-                    await mem.add(user_id, "user", text.strip())
-
-                    # Extract workout information using AI
-                    workout_info = extract_workout_info_using_ai(text, oai)
-                    exercises = workout_info.get("exercises", [])
-
-                    if not exercises:
-                        error_msg = "I couldn't identify any exercises from your message. Could you tell me what exercises you did? For example: 'I did 3 sets of 10 pushups and ran for 30 minutes'"
+                    return await workout_log_chat_stream(
+                        user_id=user_id,
+                        text=text,
+                        mem=mem,
+                        db=db
+                    )
+                except Exception as e:
+                    print(f"Error redirecting to workout logging: {e}")
+                    async def _workout_log_error():
+                        error_msg = "I encountered an issue with workout logging. Let me help you with general fitness advice instead."
+                        await mem.add(user_id, "user", text.strip())
                         await mem.add(user_id, "assistant", error_msg)
                         yield sse_escape(error_msg)
                         yield "event: done\ndata: [DONE]\n\n"
-                        return
-
-                    # Create workout summary
-                    exercise_summaries = []
-                    for exercise in exercises:
-                        name = exercise.get('name', 'Unknown Exercise')
-                        sets = exercise.get('sets', '')
-                        reps = exercise.get('reps', '')
-                        duration = exercise.get('duration', '')
-
-                        if sets and reps:
-                            exercise_summaries.append(f"{name}: {sets} sets × {reps} reps")
-                        elif duration:
-                            exercise_summaries.append(f"{name}: {duration}")
-                        else:
-                            exercise_summaries.append(name)
-
-                    message = f"🏋️ Great workout! I logged:\n\n"
-                    for i, summary in enumerate(exercise_summaries, 1):
-                        message += f"{i}. {summary}\n"
-
-                    message += f"\n💪 Keep up the excellent work! Remember to stay hydrated and get proper rest for recovery."
-
-                    await mem.add(user_id, "assistant", message)
-
-                    yield sse_json({
-                        "type": "workout_logged",
-                        "exercises": exercises,
-                        "message": message
-                    })
-
-                    yield "event: done\ndata: [DONE]\n\n"
-
-                except Exception as e:
-                    print(f"Error handling workout logging: {e}")
-                    error_msg = "I encountered an issue logging your workout. Please try again or describe your exercises differently."
+                    return StreamingResponse(_workout_log_error(), media_type="text/event-stream",
+                                           headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+            else:
+                print("ERROR: workout_log_chat_stream function not available")
+                async def _no_workout_log_function():
+                    error_msg = "Workout logging is not available. Let me help you with general fitness advice instead."
+                    await mem.add(user_id, "user", text.strip())
                     await mem.add(user_id, "assistant", error_msg)
                     yield sse_escape(error_msg)
                     yield "event: done\ndata: [DONE]\n\n"
-
-            return StreamingResponse(_handle_workout_logging(), media_type="text/event-stream",
-                                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+                return StreamingResponse(_no_workout_log_function(), media_type="text/event-stream",
+                                       headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
         
         # If AI detected an intent but it's informational (not action), continue to normal chat
         print(f"DEBUG: AI detected {intent_type} but treating as informational (action_detected: {action_detected})")
@@ -2006,7 +1974,7 @@ async def kb_upsert_file(
         text = text.decode("utf-8", "ignore")
     return {"added_chunks": KB.upsert(src or file.filename, text)}
 
-@router.post("/voice/transcribe", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+@router.post("/voice/transcribe")
 async def voice_transcribe(
     audio: UploadFile = File(...),
     http = Depends(get_http),
@@ -2050,7 +2018,7 @@ async def voice_transcribe(
         "english": transcript_en,
     }
 
-@router.post("/voice/stream_test", dependencies=[Depends(RateLimiter(times=20, seconds=60))])
+@router.post("/voice/stream_test")
 async def voice_stream_sse(
     user_id: int,
     audio: UploadFile = File(...),
